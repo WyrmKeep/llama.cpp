@@ -33,6 +33,8 @@
 #include <random>
 #include <utility>
 #include <fstream>
+#include <chrono>
+#include <cstdlib>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -44,6 +46,20 @@
 #endif
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+// DMK_TIMING=1: one line per /v1/systemone request on stderr (private build, see src/dmk-timing.h for the other lines).
+// t is CLOCK_MONOTONIC in seconds, the same clock as the llama.cpp and CUDA backend lines.
+static bool server_dmk_timing() {
+    static const bool on = [] {
+        const char * env = getenv("DMK_TIMING");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return on;
+}
+
+static int64_t server_dmk_now_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+}
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (!params.mmproj.path.empty()) {
@@ -6604,6 +6620,8 @@ void server_routes::init_routes() {
 
     this->post_systemone = [this](const server_http_req & req) {
         auto res = create_response();
+        const bool    dmk_on = server_dmk_timing();
+        const int64_t dmk_t0 = dmk_on ? server_dmk_now_ns() : 0;
         const auto & decision = ctx_server.decision;
         if (decision.type == COMMON_DECISION_TYPE_NONE) {
             res->error(format_error_response("This model is not a decision model", ERROR_TYPE_NOT_SUPPORTED));
@@ -6615,12 +6633,15 @@ void server_routes::init_routes() {
 
         std::vector<raw_buffer> files;
         const json state = decision.prepare_state(decision.parse_state(body, files));
+        const int64_t dmk_t_parsed = dmk_on ? server_dmk_now_ns() : 0;
         if (!files.empty() && (!decision.can_use_images() || !meta->has_inp_image)) {
             res->error(format_error_response("This server does not support image input for decisions. For a model that supports it, start it with `--mmproj`", ERROR_TYPE_NOT_SUPPORTED));
             return res;
         }
 
         // one task per variant of each question, or one task for all the questions
+        size_t  dmk_n_tasks = 0;
+        int64_t dmk_t_built = 0;
         auto & rd = res->rd;
         {
             std::vector<server_task> tasks;
@@ -6642,10 +6663,13 @@ void server_routes::init_routes() {
             if (decision.can_share_prompt()) {
                 tasks = server_decision_group_tasks(std::move(tasks), params.n_parallel);
             }
+            dmk_n_tasks = tasks.size();
+            dmk_t_built = dmk_on ? server_dmk_now_ns() : 0;
             rd.post_tasks(std::move(tasks));
         }
 
         auto all_results = rd.wait_for_all(req.should_stop);
+        const int64_t dmk_t_done = dmk_on ? server_dmk_now_ns() : 0;
 
         if (all_results.is_terminated) {
             return res; // connection is closed
@@ -6677,6 +6701,12 @@ void server_routes::init_routes() {
             answers[question.id] = decision.format_answer(question, scores, !files.empty());
         }
 
+        if (dmk_on) {
+            const int64_t dmk_t1 = server_dmk_now_ns();
+            fprintf(stderr, "DMK_TIMING request t=%.6f n_questions=%zu n_groups=%zu parse_us=%.0f build_us=%.0f wait_us=%.0f format_us=%.0f total_us=%.0f\n",
+                    dmk_t1 / 1e9, questions.size(), dmk_n_tasks, (dmk_t_parsed - dmk_t0) / 1e3, (dmk_t_built - dmk_t_parsed) / 1e3,
+                    (dmk_t_done - dmk_t_built) / 1e3, (dmk_t1 - dmk_t_done) / 1e3, (dmk_t1 - dmk_t0) / 1e3);
+        }
         res->ok(json{
             {"model",   meta->model_name},
             {"answers", answers},

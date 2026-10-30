@@ -1668,11 +1668,24 @@ json server_decision_context::format_answer(const server_decision_question & que
         if (s.size() != n) {
             throw std::runtime_error("decision result does not match the number of options");
         }
+        // DMK_ABLATE (timing-only build): ablated kernels leave stale or garbage logits. Such a request still has to finish,
+        // so non-finite scores become 0 and the answer is meaningless. Without DMK_ABLATE nothing changes.
+        static const bool dmk_ablate = [] {
+            const char * env = getenv("DMK_ABLATE");
+            return env != nullptr && *env != '\0';
+        }();
         // a joint head returns NaN if it could not use the decision order, +inf would make the softmax NaN
-        if (std::any_of(s.begin(), s.end(), [](float v) { return std::isnan(v) || v == INFINITY; })) {
+        if (!dmk_ablate && std::any_of(s.begin(), s.end(), [](float v) { return std::isnan(v) || v == INFINITY; })) {
             throw std::runtime_error("the model could not evaluate the decision");
         }
         std::vector<double> logits(s.begin(), s.end());
+        if (dmk_ablate) {
+            for (auto & x : logits) {
+                if (!std::isfinite(x)) {
+                    x = 0.0;
+                }
+            }
+        }
         if (question.type == SERVER_DECISION_QUESTION_SCORE && score_bias.count(n) > 0) {
             for (size_t i = 0; i < n; i++) {
                 logits[i] += score_bias.at(n)[i];
