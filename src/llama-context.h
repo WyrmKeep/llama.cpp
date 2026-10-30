@@ -8,6 +8,7 @@
 #include "llama-impl.h"
 #include "llama-memory.h"
 #include "llama-moe-cache.h"
+#include "dmk-timing.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -444,4 +445,7 @@ private:
     mutable int32_t n_eval   = 0; // number of eval calls
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
+
+    // DMK_TIMING (src/dmk-timing.h)
+    dmk::state dmk_timing;
 };

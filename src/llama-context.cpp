@@ -890,7 +890,12 @@ void llama_context::synchronize() {
         return;
     }
 
+    const bool dmk_on = dmk::timing_enabled();
+    const int64_t dmk_t0 = dmk_on ? dmk::now_ns() : 0;
     ggml_backend_sched_synchronize(sched.get());
+    if (dmk_on) {
+        dmk::print_sync(dmk_timing, dmk_t0, dmk::now_ns());
+    }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -1523,11 +1528,13 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    dmk::ubatch_timer dmk_tm; // DMK_TIMING
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
+    dmk_tm.mark(1);
 
     auto * res = get_gf_res_prev();
     auto * gf  = res->get_gf();
@@ -1547,6 +1554,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         n_reused++;
+        dmk_tm.reused = true;
     } else {
         gf_res_prev_active = nullptr;
         res->reset();
@@ -1565,12 +1573,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ret = GGML_STATUS_FAILED;
             return nullptr;
         }
+        dmk_tm.mark(2);
 
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
+        dmk_tm.mark(3);
 
         gf_res_prev_active = res;
     }
@@ -1584,8 +1594,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
+    dmk_tm.mark(4);
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    dmk_tm.mark(5);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -1593,6 +1605,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     ret = GGML_STATUS_SUCCESS;
+
+    if (dmk_tm.on) {
+        dmk::print_ubatch(dmk_timing, dmk_tm, ubatch.n_tokens, ubatch.n_seqs, ubatch.n_seq_tokens, n_outputs, ggml_graph_n_nodes(res->get_gf()));
+    }
 
     return res;
 }
@@ -1846,6 +1862,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         return encode(batch_inp);
     }
 
+    dmk::decode_scope dmk_ds(dmk_timing, batch_inp.tokens.size()); // DMK_TIMING
+
     if (batch_inp.tokens.empty()) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
@@ -1943,6 +1961,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
     llama_memory_context_ptr mctx;
 
+    const int64_t dmk_t_init = dmk_ds.on ? dmk::now_ns() : 0;
     while (true) {
         mctx = memory->init_batch(*balloc, cparams.n_ubatch, embd_all);
         if (!mctx) {
@@ -1984,6 +2003,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         }
 
         break;
+    }
+    if (dmk_ds.on) {
+        dmk_ds.init_ns = dmk::now_ns() - dmk_t_init;
     }
 
     // reserve output buffer
