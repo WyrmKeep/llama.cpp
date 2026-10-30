@@ -100,7 +100,7 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
     const int cc        = ggml_cuda_info().devices[device].cc;
     const int rows_per_block = mmf_get_rows_per_block(cc);
 
-    switch (src0->type) {
+    if (!dmk_skip(DMK_MMF)) switch (src0->type) {
         case GGML_TYPE_F32: {
             const float * src0_d = (const float *) src0->data;
             constexpr int vals_per_T = 1;

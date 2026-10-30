@@ -249,6 +249,7 @@ static int ggml_cuda_parse_id(const char * devName) {
 
 static ggml_cuda_device_info ggml_cuda_init() {
     ggml_cuda_device_info info = {};
+    dmk_ablate_init();
 
     cudaError_t err = cudaGetDeviceCount(&info.physical_device_count);
     if (err != cudaSuccess) {
@@ -1765,6 +1766,9 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
 }
 
 static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    if (dmk_skip(DMK_CUBLAS)) {
+        return;
+    }
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     const ggml_prec prec = (ggml_prec) ggml_get_op_params_i32(dst, 0);
     ggml_type compute_type = src0->type;
@@ -2112,6 +2116,11 @@ static bool ggml_cuda_should_fuse_mul_mat_q(const ggml_tensor * up, const ggml_t
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
 
+    // DMK ablation: the output-head matmul, as a whole (activation quantization included)
+    if (dmk_skip(DMK_HEAD) && dmk_is_head(src0)) {
+        return;
+    }
+
     if (ggml_cuda_op_mul_mat_use_fwht(dst) && ggml_cuda_op_fwht(ctx, src1, dst)) {
         return;
     }
@@ -2357,6 +2366,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 }
 
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
+    // DMK ablation: skip whole ggml nodes of the requested classes (MUL_MAT is gated inside its kernels, see dmk-ablate.cuh)
+    if (g_dmk_mask != 0 && (g_dmk_mask & dmk_node_class(dst)) != 0) {
+        return true;
+    }
+
     switch (dst->op) {
         case GGML_OP_ARGMAX:
             ggml_cuda_argmax(ctx, dst);
@@ -3973,8 +3987,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
             const int output_idx = i + match.node_count - 1;
             if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, match.node_count, &output_idx, 1)) {
-                ggml_cuda_op_moe_weighted_reduction(
-                    *cuda_ctx, match.experts, match.expert_scale, match.weights, match.dst);
+                DMK_RUN(DMK_OTHER, ggml_cuda_op_moe_weighted_reduction(
+                    *cuda_ctx, match.experts, match.expert_scale, match.weights, match.dst));
                 return match.node_count - 1;
             }
         }
@@ -3989,7 +4003,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             GGML_LOG_INFO("%s: fused gated_delta_net snapshot copies for %s (skipped %d nodes)\n",
                           __func__, node->name, nodes_to_skip);
 #endif
-            ggml_cuda_op_gated_delta_net_fused_cache(*cuda_ctx, node, fused_state_cpy);
+            DMK_RUN(DMK_GDN, ggml_cuda_op_gated_delta_net_fused_cache(*cuda_ctx, node, fused_state_cpy));
             return nodes_to_skip;
         }
     }
@@ -4003,7 +4017,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             GGML_LOG_INFO("%s: fused ssm_scan snapshot copies for %s (skipped %d nodes)\n",
                           __func__, node->name, nodes_to_skip);
 #endif
-            ggml_cuda_op_ssm_scan_fused_cache(*cuda_ctx, node, fused_state_cpy);
+            DMK_RUN(DMK_OTHER, ggml_cuda_op_ssm_scan_fused_cache(*cuda_ctx, node, fused_state_cpy));
             return nodes_to_skip;
         }
     }
@@ -4064,7 +4078,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
                         ggml_cuda_should_use_topk_moe(node, logits, weights, ids) &&
                         ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/true)) {
-                    ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
+                    DMK_RUN(DMK_OTHER, ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args));
                     return ops.size() - 1;
                 }
             } else if (!args.norm && !args.prob_bias) {
@@ -4079,7 +4093,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
                         ggml_cuda_should_use_topk_moe(softmax, logits, weights, ids) &&
                         ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/true)) {
-                    ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
+                    DMK_RUN(DMK_OTHER, ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args));
                     return ops.size() - 1;
                 }
             }
@@ -4091,7 +4105,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_tensor * rope     = cgraph->nodes[i];
         ggml_tensor * set_rows = cgraph->nodes[i + 2];
 
-        ggml_cuda_op_rope_fused(*cuda_ctx, rope, set_rows);
+        DMK_RUN(DMK_ROPE, ggml_cuda_op_rope_fused(*cuda_ctx, rope, set_rows));
         return 2;
     }
 
@@ -4137,7 +4151,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                                ggml_is_contiguous(a) && ggml_is_contiguous(inv_b);
 
         if (types_ok && shape_ok && dim_ok && contig_ok && x_in_add == x) {
-            ggml_cuda_op_snake_fused(*cuda_ctx, x, a, inv_b, add);
+            DMK_RUN(DMK_ELEMENTWISE, ggml_cuda_op_snake_fused(*cuda_ctx, x, a, inv_b, add));
             return 4;
         }
     }
@@ -4170,9 +4184,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             }
             fused_node.data = cgraph->nodes[i + n_fuse - 1]->data;
             if (node->op == GGML_OP_ADD) {
-                ggml_cuda_op_fused_add(*cuda_ctx, &fused_node, n_fuse);
+                DMK_RUN(DMK_ELEMENTWISE, ggml_cuda_op_fused_add(*cuda_ctx, &fused_node, n_fuse));
             } else {
-                ggml_cuda_op_fused_mul(*cuda_ctx, &fused_node, n_fuse);
+                DMK_RUN(DMK_ELEMENTWISE, ggml_cuda_op_fused_mul(*cuda_ctx, &fused_node, n_fuse));
             }
             return n_fuse - 1;
         }
@@ -4691,63 +4705,212 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
-        ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 4]);
+        DMK_RUN(DMK_NORM | DMK_ROPE, ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 4]));
         return 4;
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE }, {})) {
-        ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], nullptr);
+        DMK_RUN(DMK_NORM | DMK_ROPE, ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], nullptr));
         return 2;
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
-        ggml_cuda_op_rms_norm_fused_add(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+        DMK_RUN(DMK_NORM, ggml_cuda_op_rms_norm_fused_add(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]));
         return 2;
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
-        ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        DMK_RUN(DMK_NORM, ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]));
         return 1;
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_SCALE }, {})) {
-        ggml_cuda_op_rms_norm_scale_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        DMK_RUN(DMK_NORM, ggml_cuda_op_rms_norm_scale_fused(*cuda_ctx, node, cgraph->nodes[i + 1]));
         return 1;
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SSM_CONV, GGML_OP_ADD, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
-        ggml_cuda_op_ssm_conv(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+        DMK_RUN(DMK_SSM_CONV, ggml_cuda_op_ssm_conv(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]));
         return 2;
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SSM_CONV, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
-        ggml_cuda_op_ssm_conv(*cuda_ctx, node, /*bias_add_node=*/ nullptr, cgraph->nodes[i + 1]);
+        DMK_RUN(DMK_SSM_CONV, ggml_cuda_op_ssm_conv(*cuda_ctx, node, /*bias_add_node=*/ nullptr, cgraph->nodes[i + 1]));
         return 1;
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU }) ||
         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID }) ||
         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS })) {
-        ggml_cuda_op_unary_mul(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        DMK_RUN(DMK_GLU, ggml_cuda_op_unary_mul(*cuda_ctx, node, cgraph->nodes[i + 1]));
         return 1;
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_SQR }, { GGML_UNARY_OP_RELU })) {
-        ggml_cuda_op_relu_sqr(*cuda_ctx, node, cgraph->nodes[i + 1]);
+        DMK_RUN(DMK_ELEMENTWISE, ggml_cuda_op_relu_sqr(*cuda_ctx, node, cgraph->nodes[i + 1]));
         return 1;
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST }, { GGML_UNARY_OP_SIGMOID })) {
-        ggml_cuda_op_dsv4_hc_post(*cuda_ctx, cgraph->nodes[i + 3], node, cgraph->nodes[i + 2]);
+        DMK_RUN(DMK_OTHER, ggml_cuda_op_dsv4_hc_post(*cuda_ctx, cgraph->nodes[i + 3], node, cgraph->nodes[i + 2]));
         return 3;
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE }, { GGML_UNARY_OP_TANH })) {
-        ggml_cuda_op_softcap(*cuda_ctx, cgraph->nodes[i + 2], node);
+        DMK_RUN(DMK_ELEMENTWISE, ggml_cuda_op_softcap(*cuda_ctx, cgraph->nodes[i + 2], node));
         return 2;
     }
 
     return 0;
+}
+
+// ---- DMK_ABLATE_SYNC: direct launches with a stream sync after every ggml node, wall time per node kind ----
+// The time of a node is host launch + GPU run + sync, a few microseconds of overhead on top of the kernel.
+// DMK_ABLATE=all gives the empty-node floor to subtract. Dumped on stderr at exit, whenever no node ran for one second (so the table
+// is complete when a client finishes and the container is removed at once) and every DMK_ABLATE_SYNC_DUMP graphs:
+//   DMK_OPS <TAB> bucket <TAB> label <TAB> n <TAB> total_us <TAB> avg_us
+// bucket: tokens of the graph (ne[1] of its first MUL_MAT), label: the ggml ops of the node, fused ones joined with '+'.
+
+struct dmk_op_stat {
+    int64_t n  = 0;
+    int64_t ns = 0;
+};
+
+// never destroyed: the idle watcher thread may still run while the process exits
+static std::mutex &                                   dmk_ops_mutex = *new std::mutex;
+static std::unordered_map<std::string, dmk_op_stat> & dmk_ops       = *new std::unordered_map<std::string, dmk_op_stat>;
+static int64_t                                        dmk_ops_graphs = 0;
+static int64_t                                        dmk_ops_tokens = 0; // tokens of the graph being computed
+static std::atomic<int64_t>                           dmk_ops_last_ns{0}; // end of the last accounted node
+
+static const char * dmk_token_bucket(int64_t n) {
+    return n <= 1 ? "T1" : n <= 8 ? "T2-8" : n <= 32 ? "T9-32" : n <= 128 ? "T33-128" : n <= 512 ? "T129-512" : n <= 2048 ? "T513-2048" : "T>2048";
+}
+
+static void dmk_ops_dump(const char * why) {
+    std::lock_guard<std::mutex> lock(dmk_ops_mutex);
+    if (dmk_ops.empty()) {
+        return;
+    }
+    std::vector<std::pair<std::string, dmk_op_stat>> rows(dmk_ops.begin(), dmk_ops.end());
+    std::sort(rows.begin(), rows.end(), [](const auto & a, const auto & b) { return a.second.ns > b.second.ns; });
+    int64_t total_ns = 0;
+    for (const auto & r : rows) {
+        total_ns += r.second.ns;
+    }
+    fprintf(stderr, "DMK_OPS begin why=%s graphs=%lld\n", why, (long long) dmk_ops_graphs);
+    for (const auto & r : rows) {
+        fprintf(stderr, "DMK_OPS\t%s\t%lld\t%.1f\t%.2f\n", r.first.c_str(), (long long) r.second.n, r.second.ns / 1e3, r.second.ns / 1e3 / r.second.n);
+    }
+    fprintf(stderr, "DMK_OPS end total_us=%.1f\n", total_ns / 1e3);
+    dmk_ops.clear();
+    dmk_ops_graphs = 0;
+}
+
+static void dmk_ops_dump_exit() {
+    dmk_ops_dump("exit");
+}
+
+static void dmk_ops_idle_watch() {
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
+        const int64_t last = dmk_ops_last_ns.load();
+        if (last != 0 && dmk_now_ns() - last > 1000000000) {
+            dmk_ops_dump("idle");
+        }
+    }
+}
+
+static void dmk_sync_graph_begin(const ggml_cgraph * cgraph) {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        std::atexit(dmk_ops_dump_exit);
+        std::thread(dmk_ops_idle_watch).detach();
+    });
+
+    if (g_dmk_dump > 0 && dmk_ops_graphs >= g_dmk_dump) {
+        dmk_ops_dump("periodic");
+    }
+
+    int64_t n_tokens = 0;
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * t = cgraph->nodes[i];
+        if (t->op == GGML_OP_MUL_MAT) {
+            n_tokens = t->src[1]->ne[1];
+            break;
+        }
+    }
+    std::lock_guard<std::mutex> lock(dmk_ops_mutex);
+    dmk_ops_tokens = n_tokens;
+    dmk_ops_graphs++;
+}
+
+// the kernel family ggml_cuda_mul_mat sends this node to, same order of tests (labels only)
+static const char * dmk_mul_mat_route(int device, const ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const int cc        = ggml_cuda_info().devices[device].cc;
+    const int warp_size = ggml_cuda_info().devices[device].warp_size;
+
+    const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
+        && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
+    if (bad_padding_clear || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return "cublas";
+    }
+    if (ggml_cuda_should_use_mmvf(src0->type, cc, warp_size, src0->ne, src0->nb, src1->ne[1])) {
+        return "mmvf";
+    }
+    if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, src1->ne[1], /*mul_mat_id =*/ false)) {
+        return "mmf";
+    }
+    if (ggml_cuda_should_use_mmvq(src0->type, cc, src1->ne[1])) {
+        return "mmvq";
+    }
+    if (ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[1], /*n_experts =*/ 0)) {
+        return "mmq";
+    }
+    return "cublas";
+}
+
+static std::string dmk_node_label(int device, const ggml_cgraph * cgraph, int i, int n_fused) {
+    std::string label;
+    bool first_mul_mat = true;
+    char buf[160];
+    for (int j = i; j <= i + n_fused; j++) {
+        const ggml_tensor * t = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(t)) {
+            continue;
+        }
+        if (!label.empty()) {
+            label += '+';
+        }
+        label += ggml_op_name(t->op);
+        if (t->op == GGML_OP_UNARY) {
+            label += ':';
+            label += ggml_unary_op_name(ggml_get_unary_op(t));
+        } else if (t->op == GGML_OP_GLU) {
+            label += ':';
+            label += ggml_glu_op_name(ggml_get_glu_op(t));
+        } else if (t->op == GGML_OP_MUL_MAT && first_mul_mat) {
+            first_mul_mat = false;
+            snprintf(buf, sizeof(buf), "[%s,ne01=%lld,ne11=%lld,%s]", ggml_type_name(t->src[0]->type),
+                     (long long) t->src[0]->ne[1], (long long) t->src[1]->ne[1], dmk_mul_mat_route(device, t));
+            label += buf;
+        }
+    }
+    return label;
+}
+
+static void dmk_sync_account(ggml_backend_cuda_context * ctx, const ggml_cgraph * cgraph, int i, int n_fused, int64_t t0) {
+    CUDA_CHECK(cudaStreamSynchronize(ctx->stream()));
+    const int64_t dt = dmk_now_ns() - t0;
+
+    std::string key = dmk_node_label(ctx->device, cgraph, i, n_fused);
+    std::lock_guard<std::mutex> lock(dmk_ops_mutex);
+    key = std::string(dmk_token_bucket(dmk_ops_tokens)) + "\t" + key;
+    dmk_op_stat & st = dmk_ops[key];
+    st.n++;
+    st.ns += dt;
 }
 
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
@@ -4906,6 +5069,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                const int64_t dmk_t0 = g_dmk_sync ? dmk_now_ns() : 0;
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
@@ -4915,6 +5079,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             nodes_to_skip + 1, ggml_op_name(node->op), node->name,
                             ggml_op_name(cgraph->nodes[last_fused]->op), cgraph->nodes[last_fused]->name);
 #endif
+                    if (g_dmk_sync) {
+                        dmk_sync_account(cuda_ctx, cgraph, i, nodes_to_skip, dmk_t0);
+                    }
                     i += nodes_to_skip;
                     continue;
                 }
@@ -4940,6 +5107,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
+                if (g_dmk_sync) {
+                    dmk_sync_account(cuda_ctx, cgraph, i, 0, dmk_t0);
+                }
 
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
@@ -5044,6 +5214,14 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 #endif // USE_CUDA_GRAPH
 
+    // DMK_ABLATE_SYNC: direct launches, a CUDA graph cannot hold a stream sync
+    if (g_dmk_sync) {
+        use_cuda_graph             = false;
+        cuda_graph_update_required = false;
+        dmk_sync_graph_begin(cgraph);
+    }
+    const int64_t dmk_t0 = g_dmk_timing ? dmk_now_ns() : 0;
+
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
         {
@@ -5055,6 +5233,12 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+
+    if (g_dmk_timing) {
+        const int64_t t1 = dmk_now_ns();
+        fprintf(stderr, "DMK_TIMING cuda_compute t=%.6f n_nodes=%d mode=%s host_us=%.1f\n", t1 / 1e9, cgraph->n_nodes,
+                use_cuda_graph ? (cuda_graph_update_required ? "graph_capture" : "graph_replay") : "direct", (t1 - dmk_t0) / 1e3);
+    }
 
     return GGML_STATUS_SUCCESS;
 }

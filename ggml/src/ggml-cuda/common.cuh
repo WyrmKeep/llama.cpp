@@ -1722,3 +1722,6 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
     kernel<<<launch_params.block_nums, launch_params.block_dims, launch_params.shmem, launch_params.stream>>>(std::forward<Args>(args)... );
     CUDA_CHECK(cudaGetLastError());
 }
+
+// DMK timing-only ablation switches (host code only). Kept at the end of the file so no line number above it moves.
+#include "dmk-ablate.cuh"

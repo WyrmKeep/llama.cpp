@@ -277,7 +277,7 @@ void ggml_cuda_mul_mat_q(
                                         ne11, ne12, ne13, stream);
 
             } else {
-                quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
+                if (!dmk_skip(DMK_QUANT_MMQ)) quantize_mmq_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded,
                                        ne11, ne12, ne13, stream);
             }
             CUDA_CHECK(cudaGetLastError());
@@ -296,7 +296,7 @@ void ggml_cuda_mul_mat_q(
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
             ne1, J_best, fusion_device};
-        ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
+        if (!dmk_skip(DMK_MMQ)) ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
         return;
     }
 
@@ -353,10 +353,10 @@ void ggml_cuda_mul_mat_q(
                                         ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
             }
         } else if (dedup_bcast) {
-            quantize_scatter_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10,
+            if (!dmk_skip(DMK_QUANT_MMQ)) quantize_scatter_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10,
                                     /*stride_token=*/s12, ne10_padded, ne12, ne11_flat, n_expert_used, stream);
         } else {
-            quantize_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
+            if (!dmk_skip(DMK_QUANT_MMQ)) quantize_mmq_q8_1_cuda(src1_d, ids_src1.get(), src1_q8_1.get(), src0->type, ne10, s11, s12, s13,
                                    ne10_padded, ne11_flat, ne12_flat, ne13_flat, stream);
         }
         CUDA_CHECK(cudaGetLastError());
@@ -376,7 +376,7 @@ void ggml_cuda_mul_mat_q(
         ne03, ne13, s03, s13, s3,
         ne12, J_best, fusion_device};
 
-    ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
+    if (!dmk_skip(DMK_MMQ)) ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
 }
 
 bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts) {
