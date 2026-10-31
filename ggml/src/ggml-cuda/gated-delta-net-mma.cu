@@ -406,6 +406,10 @@ static gdn_path select_gdn_mma_path(int device, const ggml_cuda_gdn_mma_args & a
         return gdn_path::ar;
     }
     // Value splitting pays off when whole heads leave at least half the SMs idle.
+    // It does not pay off when whole heads fill most of the SMs. Measured on a GPU with 38 SMs for 16 key heads,
+    // 32 value heads, S=128, 1 to 3 sequences and 65 to 2048 tokens: the whole-head path is the fastest for every
+    // shape. The best split path takes 1.15 to 1.31 times as long, the other split paths up to 3.1 times as long.
+    // The kernel is limited by the tensor pipe, and each slice repeats the Gram matrices and the inverse.
     if (a.H * a.n_seqs * 2 <= info.nsm) {
         // A grid that already fits in one wave benefits from a larger register budget.
         if (a.H * a.n_seqs * 4 <= info.nsm) {
