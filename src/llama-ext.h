@@ -168,7 +168,10 @@ LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uin
 // every output, in the order of the list. The output head reads only the rows of these tokens, and only these values
 // are copied to the host. An empty list (n_tokens == 0) restores the logits of the whole vocabulary.
 // The list is not used when the context outputs embeddings or has backend samplers: the logits have the whole vocabulary then.
+// A list of more than 64 tokens is not used either. A list of 0 to 64 tokens is used.
 // While a list is in use, llama_get_logits() and llama_get_logits_ith() do not return data. Use the functions below.
+// The first list makes the next batch reserve the compute graphs again, with the head of a list of 64 tokens. After that,
+// batches with a list do not allocate graph memory again. A batch without a list does, because its head is the full head.
 LLAMA_API void llama_set_logit_tokens(struct llama_context * ctx, const llama_token * tokens, size_t n_tokens);
 
 // The tokens of the values in the rows of the last batch, in order. nullptr if the rows have the logits of the whole vocabulary.

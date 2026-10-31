@@ -327,6 +327,12 @@ private:
     // this is a copy: the list of the graph must not change while the graph can be reused
     std::vector<llama_token> logit_tokens_out;
 
+    // the reserved graphs have the head of a list of tokens from the first list to the end of the context: the graphs of
+    // the batches have the same nodes, and tensors that are not larger than the reserved tensors
+    // the list has LLM_GRAPH_LOGIT_TOKENS_MAX tokens
+    bool logit_tokens_reserve = false;
+    std::vector<llama_token> logit_tokens_reserve_list;
+
     // embeddings output (2-dimensional array: [n_outputs][n_embd])
     // populated only when pooling_type == LLAMA_POOLING_TYPE_NONE
     buffer_view<float> embd = {nullptr, 0};

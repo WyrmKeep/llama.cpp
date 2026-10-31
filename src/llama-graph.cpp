@@ -4322,7 +4322,10 @@ ggml_tensor * llm_graph_context::build_logits_tokens(ggml_tensor * logits) const
 
     ggml_tensor * cur = nullptr;
 
-    if (llm_graph_head_rows(logits, std::max<int64_t>(n_rows, 1), n_lt)) {
+    // the path does not depend on the number of outputs and on the length of the list of this graph: every graph of
+    // the context then has the nodes of the reserved graphs, and the tensors of the reserved graphs are not smaller
+    // (a graph with more outputs than n_outputs_max is a probe of the memory, it does not run)
+    if (n_rows <= (int64_t) cparams.n_outputs_max && llm_graph_head_rows(logits, cparams.n_outputs_max, LLM_GRAPH_LOGIT_TOKENS_MAX)) {
         // the head reads only the rows of the listed tokens
         // the product needs one column at least: an empty activation is padded, so that the topology
         // of the graph is the same for every number of outputs

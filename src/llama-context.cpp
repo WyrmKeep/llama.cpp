@@ -14,6 +14,7 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <atomic>
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
@@ -1100,6 +1101,23 @@ void llama_context::set_logit_tokens(const llama_token * tokens, size_t n_tokens
             logit_tokens.clear();
             return;
         }
+    }
+
+    if (n_tokens > LLM_GRAPH_LOGIT_TOKENS_MAX) {
+        static std::atomic<bool> warned(false);
+        if (!warned.exchange(true)) {
+            LLAMA_LOG_WARN("%s: a list has %zu tokens, the longest list has %u tokens, the logits of the whole vocabulary are computed\n",
+                    __func__, n_tokens, LLM_GRAPH_LOGIT_TOKENS_MAX);
+        }
+        logit_tokens.clear();
+        return;
+    }
+
+    if (n_tokens > 0 && !logit_tokens_reserve) {
+        // from now, the reserved graphs have the head of a list of the longest length. The next batch reserves them again.
+        logit_tokens_reserve = true;
+        logit_tokens_reserve_list.assign(LLM_GRAPH_LOGIT_TOKENS_MAX, 0);
+        sched_need_reserve = true;
     }
 
     logit_tokens.assign(tokens, tokens + n_tokens);
@@ -2750,7 +2768,10 @@ ggml_cgraph * llama_context::graph_reserve(
 
     auto * res = gf_res_reserve.get();
 
-    const auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
+    auto gparams = graph_params(res, ubatch, mctx, ctx_type_to_graph_type(cparams.ctx_type));
+
+    // the reserved graph has the head of the longest list, see logit_tokens_reserve
+    gparams.logit_tokens = logit_tokens_reserve ? &logit_tokens_reserve_list : nullptr;
 
     res->reset();
 

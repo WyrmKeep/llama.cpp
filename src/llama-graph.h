@@ -253,6 +253,10 @@ public:
     const uint32_t n_outputs;
 };
 
+// the longest list of tokens for the head of the logits: the reserved graphs have a list of this length,
+// the graphs of a longer list would have tensors that are larger than the reserved ones
+static constexpr uint32_t LLM_GRAPH_LOGIT_TOKENS_MAX = 64;
+
 // the tokens whose logits the output head computes, the same list for every output row
 class llm_graph_input_logit_tokens : public llm_graph_input_i {
 public:
