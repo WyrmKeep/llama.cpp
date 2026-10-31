@@ -699,6 +699,12 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
             max_step = std::max(max_step, sorted[s] - sorted[s - 1]);
         }
 
+        if (sorted.front() != sorted.back()) {
+            LLAMA_LOG_DEBUG("%s: sets with different lengths: n_seqs = %u, n_tokens = %u, max_step = %d, single = %d, ragged = %d\n",
+                    __func__, n_seqs, n_total, max_step, (int) single,
+                    (int) (single && n_total <= n_ubatch && max_step <= (int32_t) n_ragged_step));
+        }
+
         if (single && n_total <= n_ubatch && sorted.front() != sorted.back() && max_step <= (int32_t) n_ragged_step) {
             std::vector<int32_t> idxs;
             idxs.reserve(n_total);
