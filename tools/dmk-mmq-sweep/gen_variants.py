@@ -9,8 +9,9 @@ Rounds:
   r1   the first sweep: three block shapes, J from 8 to 128, Q4_0 and Q8_0, no fallback
   t0   a trial of three variants for the build script
   fb   the fallback table (a number of weight rows that is not a multiple of 128): J of 8, 16, 32, 64 and 128
-  ab   the baseline table (256 threads, one block for each SM, I of 128, J from 8 to 128) and, for each J, three ablations of the loads
-       of the k loop (SWEEP_ABL 1: no weight load, 2: no activation load, 3: neither). The ablations are timing only, the result is wrong.
+  ab   the baseline table (256 threads, one block for each SM, I of 128, J from 8 to 128) and, for each J, six ablations of the loads
+       of the k loop (SWEEP_ABL 1: no weight load, 2: no activation load, 3: neither, 4: weight loads read the first k block again,
+       8: the same for the activation loads, 12: both). The ablations are timing only, the result is wrong.
 """
 import sys
 import os
@@ -44,7 +45,7 @@ def configs_ab():
 
 gens = {"r1": configs_r1, "fb": configs_fb, "t0": configs_t0, "ab": configs_ab}
 fallbacks = {"r1": [0], "fb": [1], "t0": [0], "ab": [0]}
-ablations = {"r1": [0], "fb": [0], "t0": [0], "ab": [0, 1, 2, 3]}
+ablations = {"r1": [0], "fb": [0], "t0": [0], "ab": [0, 1, 2, 3, 4, 8, 12]}
 
 rows = []
 for nt, I, occ, js in gens[R]():

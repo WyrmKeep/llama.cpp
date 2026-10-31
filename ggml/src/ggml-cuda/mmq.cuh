@@ -19,7 +19,8 @@ extern int g_sweep_last_ntiles;
 extern int g_sweep_last_bps;
 
 // SWEEP only: timing ablation of the loads of the k loop. Bit 0 skips the weight tile load, bit 1 skips the activation tile loads,
-// after the first iteration of a block. The result is wrong. 0 is the code of the build.
+// after the first iteration of a block. Bit 2 (4) and bit 3 (8) make the weight and the activation loads read the first k block again.
+// The result is wrong. 0 is the code of the build.
 #ifndef SWEEP_ABL
 #define SWEEP_ABL 0
 #endif
@@ -969,17 +970,30 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);
 
     for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
+        // SWEEP ablation bits 2 and 3 (timing only, the result is wrong): the loads of every iteration read the first k block again.
+        // The loads, the unpacking and the stores to shared memory stay in the code, but the data come from the caches.
+        // The empty asm hides the value from the compiler, so it cannot hoist the loads out of the loop.
+#if SWEEP_ABL & 4
+        int kbw = kb0_start; asm volatile("" : "+r"(kbw));
+#else
+        const int kbw = kb0;
+#endif
+#if SWEEP_ABL & 8
+        int kby = kb0_start; asm volatile("" : "+r"(kby));
+#else
+        const int kby = kb0;
+#endif
 #if SWEEP_ABL & 1
         if (kb0 == kb0_start) // SWEEP ablation (timing only, the result is wrong): the weight tile is loaded in the first iteration only
 #endif
         {
-            load_tiles(x, x_gate, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
+            load_tiles(x, x_gate, tile_x, offset_x + kbw, tile_x_max_i, stride_row_x);
         }
 #if SWEEP_ABL & 2
         if (kb0 == kb0_start) // SWEEP ablation (timing only, the result is wrong): the activation tile is loaded in the first iteration only
 #endif
         {
-            const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
+            const int * by0 = y + ncols_y * (kby * qk / ne_block) * sz;
 #pragma unroll
             for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
                 int l = l0 + threadIdx.y*warp_size + threadIdx.x;
@@ -998,7 +1012,7 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
         if (kb0 == kb0_start)
 #endif
         {
-            const int * by0 = y + ncols_y * ((kb0 * qk / ne_block) * sz + sz);
+            const int * by0 = y + ncols_y * ((kby * qk / ne_block) * sz + sz);
 #pragma unroll
             for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
                 int l = l0 + threadIdx.y*warp_size + threadIdx.x;
