@@ -9607,6 +9607,108 @@ struct test_top_k_mask : public test_case {
     }
 };
 
+// GGML_OP_KQ_MASK
+struct test_kq_mask : public test_case {
+    const ggml_type type;
+    const int64_t n_kv;
+    const int64_t n_tokens;
+    const int     n_seqs;  // sequences in the batch, at most 32
+    const bool    causal;
+    const bool    is_2d;
+    const bool    pad;     // pad the row of info to 8 values as the graph does, else the rows are not 16-byte aligned
+    const bool    real;    // the cells of a cache in one sequence, the tokens at its end
+
+    std::string vars() override {
+        return VARS_TO_STR8(type, n_kv, n_tokens, n_seqs, causal, is_2d, pad, real);
+    }
+
+    // the result is 0 or -inf, the harness checks the -inf pattern, the finite values must match exactly
+    double max_err() override {
+        return 0.0;
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        double result = 0.0;
+        for (size_t i = 0; i < n; ++i) {
+            if (std::isfinite(a[i]) && std::isfinite(b[i])) {
+                result = std::max(result, (double) fabsf(a[i] - b[i]));
+            }
+        }
+        return result;
+    }
+
+    size_t op_size(ggml_tensor * t) override {
+        return ggml_nbytes(t) + 4*(n_kv + n_tokens)*sizeof(int32_t);
+    }
+
+    test_kq_mask(ggml_type type = GGML_TYPE_F16, int64_t n_kv = 256, int64_t n_tokens = 7, int n_seqs = 3,
+            bool causal = true, bool is_2d = true, bool pad = true, bool real = false)
+        : type(type), n_kv(n_kv), n_tokens(n_tokens), n_seqs(n_seqs), causal(causal), is_2d(is_2d), pad(pad), real(real) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t w = pad ? GGML_PAD(n_kv + n_tokens, 8) : n_kv + n_tokens;
+
+        ggml_tensor * info = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, w, 4);
+        ggml_set_name(info, "info");
+
+        ggml_tensor * out = ggml_kq_mask(ctx, info, n_kv, n_tokens, type, causal, is_2d);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 gen(0x4B51);
+
+        ggml_tensor * info = ggml_get_tensor(ctx, "info");
+        const int64_t w = info->ne[0];
+
+        std::vector<int32_t> pos(w, 0), seq(w, 0), x(w, 0), y(w, 0);
+
+        const uint32_t seq_all = n_seqs >= 32 ? 0xFFFFFFFFu : (1u << n_seqs) - 1;
+
+        // few positions, so that the cells and the tokens share them, and the 2D positions break the ties
+        const int32_t n_pos = 24;
+
+        for (int64_t c = 0; c < n_kv; ++c) {
+            if (real) {
+                // the cells are used from the start, the sequence 0 has all of them and the others share the head
+                const bool used = c < n_kv - n_kv/8;
+                pos[c]  = used ? (int32_t) c : -1;
+                seq[c]  = used ? (int32_t) (c < n_kv/4 ? seq_all : 1u) : 0;
+                x[c]    = used ? (int32_t) (c % 7) : 0;
+                y[c]    = used ? (int32_t) (c % 5) : 0;
+            } else {
+                const bool empty = gen() % 8 == 0;
+                pos[c]  = empty ? -1 : (int32_t) (gen() % n_pos);
+                seq[c]  = (int32_t) (gen() % 16 == 0 ? 0u : (uint32_t) gen() & seq_all);
+                x[c]    = (int32_t) (gen() % 4);
+                y[c]    = (int32_t) (gen() % 4);
+            }
+        }
+
+        for (int64_t i = 0; i < n_tokens; ++i) {
+            if (real) {
+                pos[n_kv + i] = (int32_t) (n_kv - n_kv/8 - n_tokens + i);
+                seq[n_kv + i] = 0;
+                x[n_kv + i]   = (int32_t) (pos[n_kv + i] % 7);
+                y[n_kv + i]   = (int32_t) (pos[n_kv + i] % 5);
+            } else {
+                pos[n_kv + i] = (int32_t) (gen() % n_pos);
+                seq[n_kv + i] = (int32_t) (gen() % n_seqs);
+                x[n_kv + i]   = (int32_t) (gen() % 4);
+                y[n_kv + i]   = (int32_t) (gen() % 4);
+            }
+        }
+
+        const size_t nb = w*sizeof(int32_t);
+        ggml_backend_tensor_set(info, pos.data(),  0*nb, nb);
+        ggml_backend_tensor_set(info, seq.data(),  1*nb, nb);
+        ggml_backend_tensor_set(info, x.data(),    2*nb, nb);
+        ggml_backend_tensor_set(info, y.data(),    3*nb, nb);
+    }
+};
+
 // Deserializable generic test case
 struct input_tensor {
     ggml_type type;
@@ -10414,6 +10516,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         // one mask row for all rows and streams (QSA)
         test_cases.emplace_back(new test_top_k_mask(type, 1001, 4, 70, 16, 3, true, 7, 1, 1, false, true));
         test_cases.emplace_back(new test_top_k_mask(type, 512, 8, 16, 32, 7, true, 5, 1, 4, false, true));
+
+        // attention mask from the cells and the tokens
+        test_cases.emplace_back(new test_kq_mask(type));
+        test_cases.emplace_back(new test_kq_mask(type, 1001, 7, 3));
+        test_cases.emplace_back(new test_kq_mask(type, 256, 1, 1, true, true));
+        test_cases.emplace_back(new test_kq_mask(type, 512, 64, 32));
+        test_cases.emplace_back(new test_kq_mask(type, 512, 33, 5, false, true));
+        test_cases.emplace_back(new test_kq_mask(type, 512, 33, 5, true, false));
+        test_cases.emplace_back(new test_kq_mask(type, 512, 33, 5, false, false));
+        test_cases.emplace_back(new test_kq_mask(type, 2048, 5, 2, true, true, false));
+        test_cases.emplace_back(new test_kq_mask(type, 1024, 2048, 3, true, true, true, true));
+        test_cases.emplace_back(new test_kq_mask(type, 6912, 2048, 3, true, true, true, true));
+        test_cases.emplace_back(new test_kq_mask(type, 6912, 1, 1, true, true, true, true));
+        // more row groups than the grid has blocks in y
+        test_cases.emplace_back(new test_kq_mask(type, 256, 270000, 3));
     }
 
     // GLU feeding a batched matmul (the MMQ activation quantization fusion)
@@ -13458,6 +13575,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         for (int64_t nb : { 1, 2048 }) {
             test_cases.emplace_back(new test_top_k_mask(GGML_TYPE_F16, n_kv, 4, n_kv/4, 512, 3, true, nb, 1, 1, true));
             test_cases.emplace_back(new test_top_k_mask(GGML_TYPE_F16, n_kv, 0, 0, 2048, 0, false, nb, 1, 1, true));
+        }
+    }
+
+    // kq_mask, the shapes of one slot and of three slots at the end of the cache
+    for (int64_t n_kv : { 1024, 6912, 16384 }) {
+        for (int64_t n_tokens : { 1, 7, 64, 2048 }) {
+            test_cases.emplace_back(new test_kq_mask(GGML_TYPE_F16, n_kv, n_tokens, 3, true, true, true, true));
         }
     }
 

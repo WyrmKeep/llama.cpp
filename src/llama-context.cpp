@@ -171,6 +171,12 @@ static const llm_fused_op_probe llm_fused_op_top_k_mask_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+static const llm_fused_op_probe llm_fused_op_kq_mask_probe = {
+    /*.op               =*/ LLM_FUSED_OP_KQ_MASK,
+    /*.name             =*/ "KQ mask on the device",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -337,6 +343,14 @@ llama_context::llama_context(
     // only the indexer models build this mask, skip the probe for the others
     cparams.fused_top_k_mask = true;
     cparams.auto_ftkm        = hparams.indexer_top_k > 0;
+
+    // the KQ mask is made on the device when the model has layers on a device that supports the op
+    // env: LLAMA_KQ_MASK_DEVICE=0 fills the mask on the host
+    {
+        const char * env = getenv("LLAMA_KQ_MASK_DEVICE");
+        cparams.fused_kq_mask = cparams.offload_kqv && model.n_gpu_layers() > 0 && (!env || atoi(env) != 0);
+        cparams.auto_fkqm     = cparams.fused_kq_mask;
+    }
 
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
@@ -687,6 +701,12 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
         LLAMA_LOG_INFO("%s: resolving fused top-k mask support:\n", func);
         resolve(llm_fused_op_top_k_mask_probe, cparams.fused_top_k_mask);
         cparams.auto_ftkm = false;
+    }
+
+    if (cparams.auto_fkqm) {
+        LLAMA_LOG_INFO("%s: resolving KQ mask on the device support:\n", func);
+        resolve(llm_fused_op_kq_mask_probe, cparams.fused_kq_mask);
+        cparams.auto_fkqm = false;
     }
 }
 
@@ -1590,6 +1610,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+
+    // env: LLAMA_KQ_MASK_CHECK=1 compares the KQ mask made on the device with the host mask, see llm_graph_input_attn_kv::check_output
+    static const bool kq_mask_check = [] {
+        const char * env = getenv("LLAMA_KQ_MASK_CHECK");
+        return env && atoi(env) != 0;
+    }();
+
+    if (kq_mask_check) {
+        ggml_backend_sched_synchronize(sched.get());
+        res->check_outputs(&ubatch);
     }
 
     ret = GGML_STATUS_SUCCESS;

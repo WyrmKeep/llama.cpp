@@ -54,6 +54,7 @@ enum llm_fused_op {
     LLM_FUSED_OP_DSV4_HC_COMB,
     LLM_FUSED_OP_DSV4_HC_POST,
     LLM_FUSED_OP_TOP_K_MASK,
+    LLM_FUSED_OP_KQ_MASK,
 };
 
 enum llm_ffn_op_type : int {
@@ -123,6 +124,11 @@ public:
         //   for the input type has not been implemented yet
         GGML_UNUSED(params);
         return false;
+    }
+
+    // called after the graph is computed, to check the outputs (env: LLAMA_KQ_MASK_CHECK)
+    virtual void check_output(const llama_ubatch * ubatch) {
+        GGML_UNUSED(ubatch);
     }
 protected:
     // env: LLAMA_GRAPH_INPUT_DEBUG
@@ -353,6 +359,14 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override;
 
+    // the mask is either an input filled on the host (self_kq_mask), or the result of ggml_kq_mask
+    // on the device (self_kq_mask) from the input self_kq_info
+    // the mctx is a parameter because the hybrid input does not bind the mctx of this input
+    void set_input_kq(const llama_kv_cache_context * mctx_kv, const llama_ubatch * ubatch);
+    bool can_reuse_kq(const llama_kv_cache_context * mctx_kv, const llm_graph_params & params) const;
+
+    void check_output(const llama_ubatch * ubatch) override;
+
     ggml_tensor * get_k_idxs() const { return self_k_idxs; }
     ggml_tensor * get_v_idxs() const { return self_v_idxs; }
 
@@ -363,6 +377,14 @@ public:
 
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
+
+    // set when the mask is made on the device: the cells and the tokens, see ggml_kq_mask
+    ggml_tensor * self_kq_info = nullptr; // I32 [n_kv + pad(n_batch), 4]
+    bool kq_mask_causal = false;          // the parameters of ggml_kq_mask of the graph
+    bool kq_mask_is_2d  = false;
+
+    // the host mask of the ubatch, to compare with the device mask (env: LLAMA_KQ_MASK_CHECK)
+    std::vector<uint8_t> kq_mask_ref;
 
     // note: assumes v_rot^2 == I
     ggml_tensor * self_k_rot = nullptr;
@@ -694,6 +716,8 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override;
 
+    void check_output(const llama_ubatch * ubatch) override;
+
     std::unique_ptr<llm_graph_input_attn_kv> inp_attn;
     std::unique_ptr<llm_graph_input_rs>      inp_rs;
 
@@ -938,6 +962,9 @@ public:
     void reset();
 
     void set_inputs(const llama_ubatch * ubatch);
+
+    // check the outputs of the inputs after the graph is computed, see llm_graph_input_i::check_output
+    void check_outputs(const llama_ubatch * ubatch);
     void set_outputs(const llm_graph_params & params);
 
     // try to update the existing graph result using the new graph parameters in order to reuse it

@@ -50,6 +50,8 @@ struct llama_cparams {
     bool auto_fhc;
     bool fused_top_k_mask;   // use fused top-k sparse attention mask
     bool auto_ftkm;
+    bool fused_kq_mask;      // make the KQ mask of the KV cache on the device from the cells and the tokens
+    bool auto_fkqm;
     bool no_perf;
     bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
     bool op_offload;

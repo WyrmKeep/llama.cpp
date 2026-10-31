@@ -11723,6 +11723,68 @@ void ggml_compute_forward_top_k_mask(
     }
 }
 
+// ggml_compute_forward_kq_mask
+
+void ggml_compute_forward_kq_mask(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * info = dst->src[0];
+
+    GGML_ASSERT(dst->type == GGML_TYPE_F16 || dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->nb[0] == ggml_type_size(dst->type));
+
+    const int64_t n_kv     = dst->ne[0];
+    const int64_t n_tokens = dst->ne[1];
+
+    const bool causal = ggml_get_op_params_i32(dst, 0) != 0;
+    const bool is_2d  = ggml_get_op_params_i32(dst, 1) != 0;
+
+    // the cells are the columns [0, n_kv), the tokens are the columns [n_kv, n_kv + n_tokens)
+    const int32_t * c_pos  = (const int32_t *) ((const char *) info->data + 0*info->nb[1]);
+    const int32_t * c_seqs = (const int32_t *) ((const char *) info->data + 1*info->nb[1]);
+    const int32_t * c_x    = (const int32_t *) ((const char *) info->data + 2*info->nb[1]);
+    const int32_t * c_y    = (const int32_t *) ((const char *) info->data + 3*info->nb[1]);
+
+    const int32_t * t_pos = c_pos  + n_kv;
+    const int32_t * t_seq = c_seqs + n_kv;
+    const int32_t * t_x   = c_x    + n_kv;
+    const int32_t * t_y   = c_y    + n_kv;
+
+    const ggml_fp16_t keep16 = GGML_CPU_FP32_TO_FP16(0.0f);
+    const ggml_fp16_t drop16 = GGML_CPU_FP32_TO_FP16(-INFINITY);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    for (int64_t i = ith; i < n_tokens; i += nth) {
+        const int32_t p1  = t_pos[i];
+        const uint32_t sb = 1u << (t_seq[i] & 31);
+
+        char * dst_row = (char *) dst->data + i*dst->nb[1];
+
+        for (int64_t c = 0; c < n_kv; ++c) {
+            const int32_t p0 = c_pos[c];
+
+            bool keep = p0 >= 0 && ((uint32_t) c_seqs[c] & sb) != 0;
+
+            if (keep && causal) {
+                if (p0 > p1) {
+                    keep = false;
+                } else if (is_2d && p0 == p1) {
+                    // the cell is above the token in the 2D positions of M-RoPE
+                    keep = !(c_y[c] > t_y[i] || (c_y[c] == t_y[i] && c_x[c] > t_x[i]));
+                }
+            }
+
+            if (dst->type == GGML_TYPE_F16) {
+                ((ggml_fp16_t *) dst_row)[c] = keep ? keep16 : drop16;
+            } else {
+                ((float *) dst_row)[c] = keep ? 0.0f : -INFINITY;
+            }
+        }
+    }
+}
+
 // ggml_compute_forward_rwkv_wkv7
 
 static void ggml_compute_forward_rwkv_wkv7_f32(
