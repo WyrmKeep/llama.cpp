@@ -234,6 +234,19 @@ public:
     void set_input_k_shift(ggml_tensor * dst) const;
 
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+
+    // fill a host buffer [n_kv, n_tokens/n_stream, 1, n_stream] with the mask, the same values as set_input_kq_mask
+    void fill_kq_mask(void * data, ggml_type type, int64_t n_kv, int64_t n_stream, const llama_ubatch * ubatch, bool causal_attn) const;
+
+    // the mask of the ubatch can be made on the device with ggml_kq_mask from the cells and the tokens
+    // n_stream: the number of streams in the graph of the ubatch
+    bool kq_mask_on_device(const llama_ubatch & ubatch, int64_t n_stream) const;
+
+    // the causal flag of the mask, after the non-causal type of the model
+    bool kq_mask_causal(bool causal_attn) const;
+
+    // fill the input of ggml_kq_mask: the n_kv cells of the cache, then the tokens of the ubatch
+    void set_input_kq_info(ggml_tensor * dst, const llama_ubatch * ubatch, int64_t n_kv) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
@@ -427,6 +440,12 @@ public:
 
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+
+    void fill_kq_mask(void * data, ggml_type type, int64_t n_kv, int64_t n_stream, const llama_ubatch * ubatch, bool causal_attn) const;
+
+    bool kq_mask_on_device(const llama_ubatch & ubatch, int64_t n_stream) const;
+    bool kq_mask_causal(bool causal_attn) const;
+    void set_input_kq_info(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;

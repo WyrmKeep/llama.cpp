@@ -590,6 +590,7 @@ extern "C" {
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
         GGML_OP_TOP_K_MASK,
+        GGML_OP_KQ_MASK,
 
         GGML_OP_UNARY,
 
@@ -2768,6 +2769,29 @@ extern "C" {
             struct ggml_tensor  * score,
             struct ggml_tensor  * blocks,
             struct ggml_tensor  * extra);
+
+    // attention mask of n_tokens tokens against n_kv cells of a KV cache, made from the positions and the sequences
+    //
+    // info: [w, 4] i32, w >= n_kv + n_tokens. The rows are pos, seq, x and y. The columns [0, n_kv) hold the cells
+    //       and the columns [n_kv, n_kv + n_tokens) hold the tokens. One tensor, so the host sends it with one copy.
+    // res:  [n_kv, n_tokens] f16 or f32
+    //
+    // cell:  pos < 0 marks an empty cell, bit s of seq is set when the cell is in the sequence s of the batch, s < 32
+    // token: seq is the index s of the sequence of the token in the batch
+    // x and y are the 2D positions of M-RoPE, the op reads them when is_2d is true
+    //
+    // res[c, t] = 0 when the cell is not empty, its seq has the bit of the sequence of the token, and
+    //   if causal: pos(c) <= pos(t), and if is_2d and pos(c) == pos(t): (y(c), x(c)) is not above (y(t), x(t))
+    // else -inf
+    //
+    GGML_API struct ggml_tensor * ggml_kq_mask(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * info,
+            int64_t               n_kv,
+            int64_t               n_tokens,
+            enum   ggml_type      type,
+            bool                  causal,
+            bool                  is_2d);
 
     // custom operators
 

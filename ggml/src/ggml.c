@@ -1101,6 +1101,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
     "TOP_K_MASK",
+    "KQ_MASK",
 
     "UNARY",
 
@@ -1118,7 +1119,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1217,6 +1218,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
     "top_k_mask(mask, top_k, score, blocks, extra)",
+    "kq_mask(info)",
 
     "unary(x)",
 
@@ -1234,7 +1236,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6708,6 +6710,33 @@ struct ggml_tensor * ggml_top_k_mask(
     result->src[2] = score;
     result->src[3] = blocks;
     result->src[4] = extra;
+
+    return result;
+}
+
+// ggml_kq_mask
+
+struct ggml_tensor * ggml_kq_mask(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * info,
+        int64_t               n_kv,
+        int64_t               n_tokens,
+        enum   ggml_type      type,
+        bool                  causal,
+        bool                  is_2d) {
+    GGML_ASSERT(type == GGML_TYPE_F16 || type == GGML_TYPE_F32);
+    GGML_ASSERT(info->type == GGML_TYPE_I32);
+    GGML_ASSERT(info->ne[1] == 4 && info->ne[2] == 1 && info->ne[3] == 1);
+    GGML_ASSERT(info->nb[0] == sizeof(int32_t));
+    GGML_ASSERT(n_kv > 0 && n_tokens > 0 && info->ne[0] >= n_kv + n_tokens);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, type, n_kv, n_tokens);
+
+    ggml_set_op_params_i32(result, 0, causal ? 1 : 0);
+    ggml_set_op_params_i32(result, 1, is_2d  ? 1 : 0);
+
+    result->op     = GGML_OP_KQ_MASK;
+    result->src[0] = info;
 
     return result;
 }
