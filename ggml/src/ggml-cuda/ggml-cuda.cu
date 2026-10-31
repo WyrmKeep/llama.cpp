@@ -4911,6 +4911,7 @@ static void dmk_sync_account(ggml_backend_cuda_context * ctx, const ggml_cgraph 
     dmk_op_stat & st = dmk_ops[key];
     st.n++;
     st.ns += dt;
+    dmk_ops_last_ns.store(dmk_now_ns()); // the idle watcher dumps the table one second after this
 }
 
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
