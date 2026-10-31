@@ -11,6 +11,13 @@
 #define MMQ_ITER_K_FP4         512
 #define MMQ_NWARPS               8
 
+// SWEEP only: launch knobs and diagnostics, defined by the sweep harness.
+extern int g_sweep_policy;
+extern int g_sweep_last_grid;
+extern int g_sweep_last_fixup;
+extern int g_sweep_last_ntiles;
+extern int g_sweep_last_bps;
+
 typedef void (*ggml_cuda_mmq_load_tiles_t)(const char * __restrict__ x, const char * __restrict__ x_gate, int * x_tile,
     const int kbx0, const int i_max, const int stride);
 typedef void (*ggml_cuda_mmq_vec_dot_t)(const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00);
@@ -217,7 +224,11 @@ struct ggml_cuda_mmq_config {
 
 #include "mmq-config-pascal-older.cuh"
 #include "mmq-config-pascal-dp4a.cuh"
+#ifdef SWEEP_J
+#include "mmq-config-sweep.cuh"
+#else
 #include "mmq-config-ampere.cuh"
+#endif
 #include "mmq-config-blackwell.cuh"
 
 #include "mmq-config-gcn.cuh"
@@ -1578,6 +1589,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
 
     if (has_fusion || !config.stream_k) {
         GGML_ASSERT(nty <= 65535); // gridDim.y limit
+        g_sweep_last_grid = ntx*nty*ntzw; g_sweep_last_fixup = 0; g_sweep_last_ntiles = ntx*nty*ntzw; g_sweep_last_bps = 0;
         mul_mat_q<type, J, fallback, prec_src1, has_fusion><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
             (args.x, (const char *) args.fusion.gate, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr, args.y_scale, args.fusion.glu_op, args.fusion.glu_limit,
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
@@ -1596,9 +1608,35 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     GGML_ASSERT(ntiles_dst * blocks_per_ne00_fd.z < (1 << 30)); // Assert that variable kbc will not overflow.
 
     const int nwork = ntiles_dst * ((args.ncols_x + config.K_vram - 1) / config.K_vram); // Maximum number of CUDA blocks that can do useful work.
-    const dim3 block_nums_stream_k(GGML_CUDA_CC_IS_NVIDIA(cc) && tiles_efficiency_percent >= 90 ? ntiles_dst : std::min(nsm, nwork), 1, 1);
+
+    // SWEEP: runtime grid policy and occupancy-aware wave size.
+    static int blocks_per_sm_cached = -1;
+    if (blocks_per_sm_cached < 0) {
+        int bps = 1;
+        CUDA_CHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&bps, mul_mat_q<type, J, fallback, prec_src1, has_fusion>, config.nthreads, nbytes_shared));
+        blocks_per_sm_cached = std::max(bps, 1);
+    }
+    const int blocks_per_sm = blocks_per_sm_cached;
+    int grid_x_sk;
+    switch (g_sweep_policy) {
+        case 1: grid_x_sk = ntiles_dst; break;                                  // always tiling (one CTA per tile)
+        case 2: grid_x_sk = std::min(nsm*blocks_per_sm, nwork); break;          // always persistent, one wave of nsm*occ CTAs
+        case 3: grid_x_sk = std::min(nsm, nwork); break;                        // always persistent, nsm CTAs
+        case 4: {                                                               // original rule, wave of nsm*occ
+            const int nw = (ntiles_dst + nsm*blocks_per_sm - 1) / (nsm*blocks_per_sm);
+            const int eff = 100 * ntiles_dst / (nsm*blocks_per_sm*nw);
+            grid_x_sk = eff >= 90 ? ntiles_dst : std::min(nsm*blocks_per_sm, nwork);
+            break;
+        }
+        default: grid_x_sk = tiles_efficiency_percent >= 90 ? ntiles_dst : std::min(nsm, nwork); break; // original
+    }
+    const dim3 block_nums_stream_k(grid_x_sk, 1, 1);
 
     const bool fixup_needed = ntiles_dst % block_nums_stream_k.x != 0;
+    g_sweep_last_grid  = block_nums_stream_k.x;
+    g_sweep_last_fixup = fixup_needed;
+    g_sweep_last_ntiles = ntiles_dst;
+    g_sweep_last_bps    = blocks_per_sm;
 
     ggml_cuda_pool & pool = ctx.pool(id);
     ggml_cuda_pool_alloc<float> tmp_fixup(pool);
