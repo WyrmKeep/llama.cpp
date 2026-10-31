@@ -4,6 +4,9 @@
 #include "llama-model.h"
 #include "llama-context.h"
 
+#include <algorithm>
+#include <cstdlib>
+
 //
 // llama_memory_hybrid
 //
@@ -65,6 +68,23 @@ llama_memory_hybrid::llama_memory_hybrid(
             : filter_recr
     )) {}
 
+void llama_memory_hybrid::set_ragged(bool ragged) {
+    this->ragged = ragged;
+}
+
+// the largest step between the lengths of the sequence sets of a ragged ubatch, 0 = never make ragged ubatches
+// LLAMA_RAGGED_SPLIT=0 turns the ragged split off, LLAMA_RAGGED_STEP sets the step (default 128 tokens)
+// the environment is read for every batch, so that a test can switch between the two splits
+static uint32_t llama_ragged_step() {
+    const char * env_split = getenv("LLAMA_RAGGED_SPLIT");
+    if (env_split != nullptr && atoi(env_split) == 0) {
+        return 0;
+    }
+
+    const char * env_step = getenv("LLAMA_RAGGED_STEP");
+    return env_step != nullptr ? (uint32_t) std::max(0, atoi(env_step)) : 128;
+}
+
 llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     do {
         balloc.split_reset();
@@ -87,7 +107,11 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
                 //   so that the rollback snapshots remain valid
                 const uint32_t n_rs_seq = mem_recr->n_rs_seq;
 
-                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0);
+                // sequence sets with different token counts share one ubatch when the model supports it
+                //   (not with rollback snapshots, they need the equal split to keep the trailing tokens together)
+                const uint32_t n_ragged_step = ragged && unified && n_rs_seq == 0 ? llama_ragged_step() : 0;
+
+                ubatch = balloc.split_equal(n_ubatch, !unified, n_rs_seq > 0 ? n_rs_seq + 1 : 0, n_ragged_step);
             }
 
             if (ubatch.n_tokens == 0) {

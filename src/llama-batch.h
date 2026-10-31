@@ -19,6 +19,12 @@ struct llama_ubatch {
         return b_equal_seqs != 0;
     }
 
+    // the sequence sets of the ubatch have different token counts: the tokens of the sets are stored one set
+    // after the other and seq_len[s] is the token count of set s (see llama_batch_allocr::split_equal)
+    bool ragged() const {
+        return seq_len != nullptr;
+    }
+
     // typical for M-RoPE cases:
     //   0 - sequential position of the tokens/embeddings in the sequence
     //   1 - y position in the image
@@ -74,12 +80,18 @@ struct llama_ubatch {
         std::vector<int8_t>         type;
         std::vector<int32_t>        batch_idxs;  // original batch index for each token
         std::vector<int32_t>        decision_order;
+        std::vector<int32_t>        seq_len;
 
         std::vector<llama_seq_id> seq_id_data;
     };
 
     // the llama_ubatch pointers above point to this data if set. otherwise - point to external non-owning data
     std::shared_ptr<data_t> data;
+
+    // [n_seqs] | s | token count of each sequence set, NULL unless the ubatch is ragged;
+    //   a ragged ubatch has b_equal_seqs == false and n_seq_tokens == 0
+    // note: kept after data so that the aggregate initializers of the other ubatches leave it NULL
+    int32_t * seq_len = nullptr;
 };
 
 // crash if a mixed ubatch reaches code that expects only tokens or only embd
@@ -183,7 +195,11 @@ public:
     // make ubatches of equal-length sequences sets
     // if sequential == true, the tokens in the ubatch will have increasing sequential sequence ids
     // n_keep_tail = minimum trailing tokens of a seq that must land in the same ubatch
-    llama_ubatch split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail);
+    // n_ragged_step > 0: when all the remaining tokens of the sequence sets fit in one ubatch, the lengths differ and
+    //   sorted by length no two neighbors are more than n_ragged_step tokens apart, make one ragged ubatch (see
+    //   llama_ubatch::seq_len) with all of them instead of the equal-length ubatches; only for single-sequence
+    //   sets with n_keep_tail == 0 and sequential == false
+    llama_ubatch split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail, uint32_t n_ragged_step = 0);
 
     // sequence-set-wise split - each ubatch contains a single sequence-set
     // TODO: extend to support multiple _full_ sequences in the ubatch
@@ -198,7 +214,8 @@ private:
 
     // create the next ubatch based on the provided batch indices (idxs) and the number of sequence sets (n_seqs)
     // return llama_ubatch.n_tokens == 0 if the entire batch was consumed
-    llama_ubatch ubatch_add(const std::vector<int32_t> & idxs, uint32_t n_seqs, bool equal_seqs);
+    // seq_len: the token count of each sequence set of a ragged ubatch (equal_seqs must be false), NULL otherwise
+    llama_ubatch ubatch_add(const std::vector<int32_t> & idxs, uint32_t n_seqs, bool equal_seqs, const std::vector<int32_t> * seq_len = nullptr);
 
     // for debugging, start with LLAMA_BATCH_DEBUG=2
     void ubatch_print(const llama_ubatch & ubatch, int debug);

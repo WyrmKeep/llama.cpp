@@ -665,6 +665,128 @@ static void test_split(testing & t) {
         t.assert_equal(6u, ba.get_n_used());
     });
 
+    t.test("split_equal_ragged", [&](testing & t) {
+        batch_builder bb;
+        for (int i = 0; i < 4; ++i) {
+            bb.add(i, {0}, i == 3);
+        }
+        for (int i = 0; i < 2; ++i) {
+            bb.add(i, {1}, i == 1);
+        }
+        for (int i = 0; i < 3; ++i) {
+            bb.add(i, {2}, i == 2);
+        }
+
+        llama_batch_allocr ba(1);
+        t.assert_true(ba.init(bb.b, vocab, false));
+
+        llama_ubatch ub = ba.split_equal(16, false, 0, 8);
+        t.assert_true(ub.ragged());
+        t.assert_true(!ub.equal_seqs());
+        t.assert_equal("all the tokens of the sets in one ubatch", 9u, ub.n_tokens);
+        t.assert_equal(0u, ub.n_seq_tokens);
+        t.assert_equal(3u, ub.n_seqs);
+        t.assert_equal(3u, ub.n_seqs_unq);
+        t.assert_equal(4, ub.seq_len[0]);
+        t.assert_equal(2, ub.seq_len[1]);
+        t.assert_equal(3, ub.seq_len[2]);
+        // tokens are grouped per sequence set: [s0 s0 s0 s0 s1 s1 s2 s2 s2]
+        const llama_seq_id seq_ids[] = { 0, 0, 0, 0, 1, 1, 2, 2, 2 };
+        const llama_pos    poss[]    = { 0, 1, 2, 3, 0, 1, 0, 1, 2 };
+        for (uint32_t i = 0; i < 9; ++i) {
+            t.assert_equal(seq_ids[i], ub.seq_id[i][0]);
+            t.assert_equal(poss[i],    ub.pos[i]);
+        }
+        t.assert_equal(9u, ba.get_n_used());
+
+        ub = ba.split_equal(16, false, 0, 8);
+        t.assert_equal(0u, ub.n_tokens);
+    });
+
+    t.test("split_equal_ragged_falls_back", [&](testing & t) {
+        const auto make = [&](batch_builder & bb, int len0, int len1, std::initializer_list<llama_seq_id> seqs1) {
+            for (int i = 0; i < len0; ++i) {
+                bb.add(i, {0}, i == len0 - 1);
+            }
+            for (int i = 0; i < len1; ++i) {
+                bb.add(i, seqs1, i == len1 - 1);
+            }
+        };
+
+        // the ubatch the equal split makes first: both sets advance by the shorter length
+        const auto expect_equal = [&](testing & t, llama_ubatch & ub) {
+            t.assert_true(!ub.ragged());
+            t.assert_true(ub.equal_seqs());
+            t.assert_equal(4u, ub.n_tokens);
+            t.assert_equal(2u, ub.n_seq_tokens);
+        };
+
+        {
+            batch_builder bb;
+            make(bb, 4, 2, { 1 });
+            llama_batch_allocr ba(1);
+            t.assert_true(ba.init(bb.b, vocab, false));
+            llama_ubatch ub = ba.split_equal(8, false, 0, 0);
+            expect_equal(t, ub);
+        }
+        {
+            // the step between the lengths of the sets (2 and 2) is larger than the allowed step
+            batch_builder bb;
+            make(bb, 4, 2, { 1 });
+            llama_batch_allocr ba(1);
+            t.assert_true(ba.init(bb.b, vocab, false));
+            llama_ubatch ub = ba.split_equal(8, false, 0, 1);
+            expect_equal(t, ub);
+        }
+        {
+            // the sets do not fit in one ubatch
+            batch_builder bb;
+            make(bb, 4, 2, { 1 });
+            llama_batch_allocr ba(1);
+            t.assert_true(ba.init(bb.b, vocab, false));
+            llama_ubatch ub = ba.split_equal(5, false, 0, 8);
+            expect_equal(t, ub);
+        }
+        {
+            // the trailing tokens are kept together
+            batch_builder bb;
+            make(bb, 4, 2, { 1 });
+            llama_batch_allocr ba(1);
+            t.assert_true(ba.init(bb.b, vocab, false));
+            llama_ubatch ub = ba.split_equal(8, false, 1, 8);
+            t.assert_true(!ub.ragged());
+        }
+        {
+            // sequential split
+            batch_builder bb;
+            make(bb, 4, 2, { 1 });
+            llama_batch_allocr ba(1);
+            t.assert_true(ba.init(bb.b, vocab, false));
+            llama_ubatch ub = ba.split_equal(8, true, 0, 8);
+            expect_equal(t, ub);
+        }
+        {
+            // a set with two sequences
+            batch_builder bb;
+            make(bb, 4, 2, { 1, 2 });
+            llama_batch_allocr ba(1);
+            t.assert_true(ba.init(bb.b, vocab, false));
+            llama_ubatch ub = ba.split_equal(8, false, 0, 8);
+            expect_equal(t, ub);
+        }
+        {
+            // the sets have the same length
+            batch_builder bb;
+            make(bb, 3, 3, { 1 });
+            llama_batch_allocr ba(1);
+            t.assert_true(ba.init(bb.b, vocab, false));
+            llama_ubatch ub = ba.split_equal(8, false, 0, 8);
+            t.assert_true(!ub.ragged());
+            t.assert_equal(6u, ub.n_tokens);
+            t.assert_equal(3u, ub.n_seq_tokens);
+        }
+    });
+
     t.test("split_equal_coupled", [&](testing & t) {
         batch_builder bb;
         bb.add(0, {0, 1}, false);

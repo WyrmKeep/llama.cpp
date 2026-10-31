@@ -515,6 +515,20 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
     const uint32_t n_seq_tokens = ubatch.n_seq_tokens;
     const uint32_t n_seqs       = ubatch.n_seqs;
 
+    // the first token and the number of tokens of sequence set s (the sets of a ragged ubatch have different lengths)
+    std::vector<uint32_t> first_tok;
+    if (ubatch.ragged()) {
+        first_tok.resize(n_seqs);
+
+        uint32_t n_prev = 0;
+        for (uint32_t s = 0; s < n_seqs; ++s) {
+            first_tok[s] = n_prev;
+            n_prev += ubatch.seq_len[s];
+        }
+    }
+    const auto seq_first = [&](uint32_t s) -> uint32_t { return ubatch.ragged() ? first_tok[s] : s*n_seq_tokens; };
+    const auto seq_len   = [&](uint32_t s) -> uint32_t { return ubatch.ragged() ? (uint32_t) ubatch.seq_len[s] : n_seq_tokens; };
+
     // if we have enough unused cells before the current head ->
     //   better to start searching from the beginning of the cache, hoping to fill it
     if (head > used + 2*n_seqs) {
@@ -525,15 +539,15 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
     // each cache cell can store the state for a whole sequence.
     // A slot should be always be contiguous.
 
-    // can only process batches with an equal number of new tokens in each sequence
-    GGML_ASSERT(ubatch.equal_seqs());
+    // can only process batches with an equal number of new tokens in each sequence, or ragged ubatches
+    GGML_ASSERT(ubatch.equal_seqs() || ubatch.ragged());
 
     int32_t min = size - 1;
     int32_t max = 0;
 
     // everything should fit if all seq_ids are smaller than the max
     for (uint32_t s = 0; s < n_seqs; ++s) {
-        const uint32_t i = s*n_seq_tokens; // first token of sequence set s
+        const uint32_t i = seq_first(s); // first token of sequence set s
         const uint32_t n_seq_id = ubatch.n_seq_id[i];
 
         for (uint32_t j = 0; j < n_seq_id; ++j) {
@@ -596,7 +610,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
 
     // find usable cell range
     for (uint32_t s = 0; s < n_seqs; ++s) {
-        const uint32_t i = s*n_seq_tokens;
+        const uint32_t i = seq_first(s);
         const llama_seq_id seq_id = ubatch.seq_id[i][0];
         auto & seq_meta = cells[seq_id];
         bool has_cell = false;
@@ -635,7 +649,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
 
     // gather and re-order
     for (uint32_t s = 0; s < n_seqs; ++s) {
-        const uint32_t i = s*n_seq_tokens;
+        const uint32_t i = seq_first(s);
         const int32_t dst_id = s + min;
         const int32_t src_id = cells[ubatch.seq_id[i][0]].tail;
         if (dst_id != src_id) {
@@ -660,16 +674,16 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
 
     // update the pos of the used seqs
     for (uint32_t s = 0; s < n_seqs; ++s) {
-        const uint32_t i = s*n_seq_tokens;
-        const llama_pos last_pos = ubatch.pos[i + n_seq_tokens - 1];
+        const uint32_t i = seq_first(s);
+        const llama_pos last_pos = ubatch.pos[i + seq_len(s) - 1];
         const int32_t cell_id = s + min;
         auto & cell = cells[cell_id];
 
-        if (cell.pos >= 0 && last_pos != cell.pos + (llama_pos) n_seq_tokens) {
+        if (cell.pos >= 0 && last_pos != cell.pos + (llama_pos) seq_len(s)) {
             // What should happen when the pos backtracks or skips a value?
             // Clearing the state mid-batch would require special-casing which isn't done.
             LLAMA_LOG_WARN("%s: non-consecutive token position %d after %d for sequence %d with %u new tokens\n",
-                __func__, last_pos, cell.pos, ubatch.seq_id[i][0], n_seq_tokens);
+                __func__, last_pos, cell.pos, ubatch.seq_id[i][0], seq_len(s));
         }
         cell.pos = last_pos;
         cell.seq_id.clear();

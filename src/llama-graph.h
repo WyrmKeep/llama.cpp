@@ -287,12 +287,18 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override;
 
+    // set seq_off when the ubatch is ragged
+    void set_seq_off(const llama_ubatch * ubatch);
+
     ggml_tensor * s_copy;  // I32 [n_rs]
 
     // views of s_copy, computed once per graph
     // and shared across layers which use build_rs
     ggml_tensor * s_copy_main; // I32 [n_seqs]
     ggml_tensor * s_copy_tail; // I32 [n_rs - 1]
+
+    // ragged ubatch only: the first token of each sequence set, then the token count of the ubatch, I32 [n_seqs + 1]
+    ggml_tensor * seq_off = nullptr;
 
     const llama_memory_recurrent_context * mctx;
 

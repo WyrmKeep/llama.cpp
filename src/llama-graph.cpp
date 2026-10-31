@@ -397,8 +397,6 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
 }
 
 void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
-    GGML_UNUSED(ubatch);
-
     const int64_t n_rs = mctx->get_n_rs();
 
     if (s_copy) {
@@ -410,6 +408,23 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->s_copy(i);
         }
     }
+
+    set_seq_off(ubatch);
+}
+
+void llm_graph_input_rs::set_seq_off(const llama_ubatch * ubatch) {
+    if (seq_off == nullptr) {
+        return;
+    }
+
+    GGML_ASSERT(ubatch->ragged());
+
+    std::vector<int32_t> off(ubatch->n_seqs + 1, 0);
+    for (uint32_t s = 0; s < ubatch->n_seqs; ++s) {
+        off[s + 1] = off[s] + ubatch->seq_len[s];
+    }
+
+    ggml_backend_tensor_set(seq_off, off.data(), 0, off.size()*sizeof(int32_t));
 }
 
 bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
@@ -425,6 +440,7 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
 
     res &= head == mctx->get_head();
     res &= rs_z == mctx->get_rs_z();
+    res &= (seq_off != nullptr) == params.ubatch.ragged();
 
     return res;
 }
@@ -1195,6 +1211,8 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
             data[i] = mctx->get_recr()->s_copy(i);
         }
     }
+
+    inp_rs->set_seq_off(ubatch);
 }
 
 bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
@@ -1215,6 +1233,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= (inp_rs->seq_off != nullptr) == params.ubatch.ragged();
 
     return res;
 }
@@ -3970,6 +3989,13 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
 
     inp->head = mctx_cur->get_head();
     inp->rs_z = mctx_cur->get_rs_z();
+
+    // ragged ubatch: the recurrent ops get the sequence boundaries from this input
+    if (ubatch.ragged()) {
+        inp->seq_off = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_seqs + 1);
+        ggml_set_input(inp->seq_off);
+        ggml_set_name(inp->seq_off, "rs_seq_off");
+    }
 
     return inp;
 }

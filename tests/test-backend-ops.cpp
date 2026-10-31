@@ -5551,6 +5551,179 @@ struct test_gated_delta_net_cache_fusion : public test_case {
     }
 };
 
+static std::string lens_to_str(const std::vector<int32_t> & lens) {
+    std::string s = "[";
+    for (size_t i = 0; i < lens.size(); i++) {
+        s += (i ? " " : "") + std::to_string(lens[i]);
+    }
+    return s + "]";
+}
+
+// fills seq_off ([n_seqs + 1] I32, the start of each sequence in the token row) from the sequence lengths
+static void init_seq_off(ggml_tensor * t, const std::vector<int32_t> & lens) {
+    GGML_ASSERT(t->ne[0] == (int64_t) lens.size() + 1);
+    std::vector<int32_t> off(lens.size() + 1, 0);
+    for (size_t i = 0; i < lens.size(); i++) {
+        off[i + 1] = off[i] + lens[i];
+    }
+    ggml_backend_tensor_set(t, off.data(), 0, off.size() * sizeof(int32_t));
+}
+
+// GGML_OP_SSM_CONV_RAGGED
+struct test_ssm_conv_ragged : public test_case {
+    const int64_t d_conv;
+    const int64_t d_inner;
+    const std::vector<int32_t> lens; // tokens of each sequence
+    const bool silu;
+
+    std::string vars() override {
+        return VARS_TO_STR3(d_conv, d_inner, silu) + ",lens=" + lens_to_str(lens);
+    }
+
+    test_ssm_conv_ragged(int64_t d_conv, int64_t d_inner, std::vector<int32_t> lens, bool silu)
+        : d_conv(d_conv), d_inner(d_inner), lens(std::move(lens)), silu(silu) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        int64_t n_tokens = 0;
+        for (int32_t l : lens) {
+            n_tokens += l;
+        }
+        const int64_t n_seqs = lens.size();
+
+        ggml_tensor * states  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_conv - 1, d_inner, n_seqs);
+        ggml_tensor * x       = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_inner, n_tokens);
+        ggml_tensor * w       = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, d_inner);
+        ggml_tensor * seq_off = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs + 1);
+        ggml_set_name(states,  "states");
+        ggml_set_name(x,       "x");
+        ggml_set_name(w,       "w");
+        ggml_set_name(seq_off, "seq_off");
+        return ggml_ssm_conv_ragged(ctx, states, x, w, seq_off, silu);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "seq_off") == 0) {
+                init_seq_off(t, lens);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// GGML_OP_GATED_DELTA_NET_RAGGED, optionally followed by the cpy of the final states into a cache
+// (the cpy is fused into the kernel on CUDA)
+struct test_gated_delta_net_ragged : public test_case {
+    const int64_t head_count;
+    const int64_t head_size;
+    const int     v_repeat;
+    const std::vector<int32_t> lens; // tokens of each sequence
+    const bool    cache;
+
+    ggml_tensor * cpy_node  = nullptr;
+    ggml_tensor * attn_node = nullptr;
+
+    std::string vars() override {
+        return VARS_TO_STR4(head_count, head_size, v_repeat, cache) + ",lens=" + lens_to_str(lens);
+    }
+
+    test_gated_delta_net_ragged(int64_t head_count, int64_t head_size, int v_repeat, std::vector<int32_t> lens, bool cache = false)
+        : head_count(head_count), head_size(head_size), v_repeat(v_repeat), lens(std::move(lens)), cache(cache) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        int64_t n_tokens = 0;
+        for (int32_t l : lens) {
+            n_tokens += l;
+        }
+        const int64_t n_seqs = lens.size();
+        const int64_t S_v    = head_size;
+        const int64_t H_v    = head_count * v_repeat;
+        const int64_t D      = S_v * S_v * H_v;
+
+        ggml_tensor * q       = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_count, n_tokens, 1);
+        ggml_tensor * k       = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_count, n_tokens, 1);
+        ggml_tensor * v       = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, H_v, n_tokens, 1);
+        ggml_tensor * g       = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H_v, n_tokens, 1);
+        ggml_tensor * beta    = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H_v, n_tokens, 1);
+        ggml_tensor * state   = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_size, head_size, H_v, n_seqs);
+        ggml_tensor * seq_off = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs + 1);
+        ggml_set_name(q,       "q");
+        ggml_set_name(k,       "k");
+        ggml_set_name(v,       "v");
+        ggml_set_name(g,       "g");
+        ggml_set_name(beta,    "beta");
+        ggml_set_name(state,   "state");
+        ggml_set_name(seq_off, "seq_off");
+
+        // q/k are L2-normalised in qwen35 before delta_net
+        q = ggml_l2_norm(ctx, q, 1e-6f);
+        k = ggml_l2_norm(ctx, k, 1e-6f);
+
+        ggml_tensor * out = ggml_gated_delta_net_ragged(ctx, q, k, v, g, beta, state, seq_off);
+        ggml_set_name(out, "gdn_out");
+        if (!cache) {
+            return out;
+        }
+
+        // attn scores: the first n_tokens rows of the output
+        ggml_tensor * attn = ggml_cont(ctx, ggml_view_2d(ctx, out, S_v * H_v, n_tokens, ggml_row_size(out->type, S_v * H_v), 0));
+        ggml_set_name(attn, "attn");
+        attn_node = attn;
+
+        // final states: the rows after the attention scores
+        ggml_tensor * src = ggml_view_2d(ctx, out, D, n_seqs, ggml_row_size(out->type, D),
+                ggml_row_size(out->type, S_v * H_v * n_tokens));
+
+        // recurrent cache view [D, n_seqs]
+        ggml_tensor * cache_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, D, n_seqs);
+        ggml_set_name(cache_t, "cache");
+        ggml_tensor * dst = ggml_view_2d(ctx, cache_t, D, n_seqs, ggml_row_size(cache_t->type, D), 0);
+
+        ggml_tensor * cpy = ggml_cpy(ctx, src, dst);
+        ggml_set_name(cpy, "gdn_cache_cpy");
+        cpy_node = cpy;
+
+        // read the cpy output so that neither the gdn nor the cpy is the graph output
+        return ggml_add(ctx, ggml_sum(ctx, cpy), ggml_sum(ctx, attn));
+    }
+
+    bool run_whole_graph() override { return cache; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        return cache ? std::vector<ggml_tensor *>{ cpy_node, attn_node } : std::vector<ggml_tensor *>{};
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        uint64_t n_tokens = 0;
+        for (int32_t l : lens) {
+            n_tokens += l;
+        }
+        const uint64_t S_v = head_size;
+        const uint64_t H_v = (uint64_t) head_count * v_repeat;
+        return (4ull*S_v + 2ull*S_v*S_v) * H_v * n_tokens;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) { continue; }
+            if (strcmp(t->name, "seq_off") == 0) {
+                init_seq_off(t, lens);
+            } else if (strcmp(t->name, "g") == 0) {
+                init_tensor_uniform(t, -20.0f, -1e-4f);
+            } else if (strcmp(t->name, "beta") == 0) {
+                init_tensor_uniform(t, 0.0f, 1.0f);
+            } else if (strcmp(t->name, "v") == 0) {
+                init_tensor_uniform(t, -0.3f, 5.0f);
+            } else if (strcmp(t->name, "cache") == 0) {
+                init_tensor_uniform(t, 0.0f, 0.0f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_GATED_LINEAR_ATTN
 struct test_gla : public test_case {
     const ggml_type type;
@@ -11358,6 +11531,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // ssm_conv for sequences with different token counts in one batch (also a sequence without tokens)
+    for (int64_t d_conv : {3, 4, 7}) {
+        for (bool silu : {false, true}) {
+            test_cases.emplace_back(new test_ssm_conv_ragged(d_conv, 1024, {1, 5, 40}, silu));
+            test_cases.emplace_back(new test_ssm_conv_ragged(d_conv, 1024, {5, 0, 40}, silu));
+        }
+    }
+    for (bool silu : {false, true}) {
+        test_cases.emplace_back(new test_ssm_conv_ragged(4, 8192, {43, 47, 73}, silu));
+        test_cases.emplace_back(new test_ssm_conv_ragged(4, 8192, {51, 120}, silu));
+        test_cases.emplace_back(new test_ssm_conv_ragged(4, 8192, {2, 33, 2, 64, 31}, silu));
+    }
+
     // fused ssm_conv + (optional) bias_add + silu. The bias-only graph (no silu) is intentionally
     // not tested since there's no fusion for that pattern in ggml_cuda_can_fuse.
     for (int64_t d_conv : {3, 4, 7, 9}) {
@@ -12853,6 +13039,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 256, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  65, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 100, 1));
+
+    // sequences with different token counts in one batch; the cache cases also test the cpy fused into the kernel
+    test_cases.emplace_back(new test_gated_delta_net_ragged(4, 16, 1, {3, 1, 7}));
+    test_cases.emplace_back(new test_gated_delta_net_ragged(4, 32, 2, {5, 0, 9}));
+    test_cases.emplace_back(new test_gated_delta_net_ragged(4, 64, 1, {20, 1, 2, 64}));
+    test_cases.emplace_back(new test_gated_delta_net_ragged(16, 128, 2, {43, 47, 73}));
+    test_cases.emplace_back(new test_gated_delta_net_ragged(16, 128, 2, {51, 120}));
+    test_cases.emplace_back(new test_gated_delta_net_ragged(16, 128, 2, {5, 1, 3}, true));
+    test_cases.emplace_back(new test_gated_delta_net_ragged(16, 128, 2, {43, 47, 73}, true));
+    test_cases.emplace_back(new test_gated_delta_net_ragged(4, 32, 1, {5, 0, 9}, true));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 200, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64, 127, 2));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 64,  64, 1, 1, false, true));

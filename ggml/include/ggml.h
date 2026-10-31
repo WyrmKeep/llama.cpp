@@ -606,6 +606,10 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        // appended at the end so that the values of the other ops do not change
+        GGML_OP_SSM_CONV_RAGGED,
+        GGML_OP_GATED_DELTA_NET_RAGGED,
+
         GGML_OP_COUNT,
     };
 
@@ -2548,6 +2552,27 @@ extern "C" {
             struct ggml_tensor  * sx,
             struct ggml_tensor  * c);
 
+    // ssm_conv for sequences of different lengths in one batch
+    //
+    //   states  : [d_conv - 1, d_inner, n_seqs] F32, the conv state of each sequence before the batch
+    //   x       : [d_inner, n_tokens] F32, the new inputs; the tokens of sequence s are the columns
+    //             seq_off[s] .. seq_off[s + 1] - 1
+    //   c       : [d_conv, d_inner] F32, the weights
+    //   seq_off : [n_seqs + 1] I32, token offset of each sequence, seq_off[0] = 0, seq_off[n_seqs] = n_tokens
+    //
+    // the output packs two parts in one tensor [d_inner, n_tokens + (d_conv - 1) * n_seqs]:
+    //   conv output [d_inner, n_tokens] (SiLU of the convolution when silu is true), followed by
+    //   the new conv states [d_conv - 1, d_inner, n_seqs]: the last d_conv - 1 columns of the conv input
+    //   (the state, then the new inputs) of each sequence. A sequence with fewer than d_conv - 1 tokens
+    //   keeps the end of its old state.
+    GGML_API struct ggml_tensor * ggml_ssm_conv_ragged(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * states,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * c,
+            struct ggml_tensor  * seq_off,
+            bool                  silu);
+
     GGML_API struct ggml_tensor * ggml_ssm_scan(
             struct ggml_context * ctx,
             struct ggml_tensor  * s,
@@ -2681,6 +2706,28 @@ extern "C" {
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state,
             int64_t               K);
+
+    // ggml_gated_delta_net (K == 1, scalar gate) for sequences of different lengths in one batch
+    //
+    // tensor shapes (S_k == S_v, H_v % H_k == 0):
+    //   q, k    : [S_k, H_k, n_tokens, 1]
+    //   v       : [S_v, H_v, n_tokens, 1]
+    //   g       : [1, H_v, n_tokens, 1]
+    //   beta    : [1, H_v, n_tokens, 1]
+    //   state   : [S_v, S_v, H_v, n_seqs] -- initial recurrent state s0 of each sequence
+    //   seq_off : [n_seqs + 1] I32, the tokens of sequence s are seq_off[s] .. seq_off[s + 1] - 1
+    //
+    // the output packs the attention scores [S_v, H_v, n_tokens] followed by the final state of each
+    // sequence [S_v, S_v, H_v, n_seqs]: [S_v * H_v, n_tokens + S_v * n_seqs]. A sequence with no token keeps its state.
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_ragged(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * seq_off);
 
     // DSA lightning indexer
     //
