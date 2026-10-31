@@ -16,6 +16,7 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "../../src/llama-ext.h" // staging API: llama_set_logit_tokens
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -2524,15 +2525,34 @@ private:
             }
             res->scores.assign(embd, embd + llama_model_n_embd_out(model_tgt));
         } else if (!decision.labels.empty()) {
-            const float * logits = llama_get_logits_ith(slot.ctx_tgt, i_batch);
-            if (logits == nullptr) {
-                send_error(slot, "failed to get logits", ERROR_TYPE_SERVER);
-                return;
-            }
-            const int32_t n_vocab = llama_vocab_n_tokens(vocab);
-            for (const llama_token label : decision.labels) {
-                GGML_ASSERT(label >= 0 && label < n_vocab);
-                res->scores.push_back(logits[label]);
+            // the head computed the logits of the labels of the batch only, or the logits of the whole vocabulary
+            size_t n_tokens = 0;
+            const llama_token * tokens = llama_get_logit_tokens(slot.ctx_tgt, &n_tokens);
+            if (tokens != nullptr) {
+                const float * logits = llama_get_logit_tokens_ith(slot.ctx_tgt, i_batch);
+                if (logits == nullptr) {
+                    send_error(slot, "failed to get logits", ERROR_TYPE_SERVER);
+                    return;
+                }
+                for (const llama_token label : decision.labels) {
+                    const llama_token * it = std::find(tokens, tokens + n_tokens, label);
+                    if (it == tokens + n_tokens) {
+                        send_error(slot, "the logits of a label are missing", ERROR_TYPE_SERVER);
+                        return;
+                    }
+                    res->scores.push_back(logits[it - tokens]);
+                }
+            } else {
+                const float * logits = llama_get_logits_ith(slot.ctx_tgt, i_batch);
+                if (logits == nullptr) {
+                    send_error(slot, "failed to get logits", ERROR_TYPE_SERVER);
+                    return;
+                }
+                const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+                for (const llama_token label : decision.labels) {
+                    GGML_ASSERT(label >= 0 && label < n_vocab);
+                    res->scores.push_back(logits[label]);
+                }
             }
             if (!decision.label_groups.empty()) {
                 std::vector<float> scores;
@@ -3625,6 +3645,23 @@ private:
             }
 
             llama_set_embeddings(ctx_tgt, slot_batched->need_embd());
+
+            // the decisions of a batch read the logits of their labels only: the output head computes these tokens
+            // the context ignores the list when it outputs embeddings
+            std::vector<llama_token> logit_tokens;
+            if (slot_batched->task->type == SERVER_TASK_TYPE_DECISION) {
+                for (const auto & slot : slots) {
+                    if (!slot.is_processing() || slot.task->type != SERVER_TASK_TYPE_DECISION) {
+                        continue;
+                    }
+                    for (const llama_token label : slot.task->decision.labels) {
+                        if (std::find(logit_tokens.begin(), logit_tokens.end(), label) == logit_tokens.end()) {
+                            logit_tokens.push_back(label);
+                        }
+                    }
+                }
+            }
+            llama_set_logit_tokens(ctx_tgt, logit_tokens.data(), logit_tokens.size());
         }
 
         int32_t off_next = 0;

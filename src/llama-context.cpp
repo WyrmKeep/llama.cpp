@@ -1030,6 +1030,11 @@ enum llama_pooling_type llama_context::pooling_type() const {
 float * llama_context::get_logits() {
     output_reorder();
 
+    if (!logit_tokens_out.empty()) {
+        LLAMA_LOG_ERROR("%s: the rows have the logits of a list of tokens, use llama_get_logit_tokens_ith\n", __func__);
+        return nullptr;
+    }
+
     return logits.data;
 }
 
@@ -1070,8 +1075,58 @@ float * llama_context::get_logits_ith(int32_t i) {
             throw std::runtime_error("no logits");
         }
 
+        if (!logit_tokens_out.empty()) {
+            throw std::runtime_error("the rows have the logits of a list of tokens, use llama_get_logit_tokens_ith");
+        }
+
         const int64_t j = output_resolve_row(i);
         return logits.data + j*model.vocab.n_tokens();
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: invalid logits id %d, reason: %s\n", __func__, i, err.what());
+#ifndef NDEBUG
+        GGML_ABORT("fatal error");
+#else
+        return nullptr;
+#endif
+    }
+}
+
+void llama_context::set_logit_tokens(const llama_token * tokens, size_t n_tokens) {
+    const int32_t n_vocab = model.vocab.n_tokens();
+
+    for (size_t i = 0; i < n_tokens; ++i) {
+        if (tokens[i] < 0 || tokens[i] >= n_vocab) {
+            LLAMA_LOG_ERROR("%s: token %d is not in the vocabulary, the logits of the whole vocabulary are computed\n", __func__, tokens[i]);
+            logit_tokens.clear();
+            return;
+        }
+    }
+
+    logit_tokens.assign(tokens, tokens + n_tokens);
+}
+
+const llama_token * llama_context::get_logit_tokens(size_t * n_tokens) const {
+    if (n_tokens) {
+        *n_tokens = logit_tokens_out.size();
+    }
+
+    return logit_tokens_out.empty() ? nullptr : logit_tokens_out.data();
+}
+
+float * llama_context::get_logit_tokens_ith(int32_t i) {
+    output_reorder();
+
+    if (logit_tokens_out.empty()) {
+        return nullptr;
+    }
+
+    try {
+        if (logits.data == nullptr) {
+            throw std::runtime_error("no logits");
+        }
+
+        const int64_t j = output_resolve_row(i);
+        return logits.data + j*logit_tokens_out.size();
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: invalid logits id %d, reason: %s\n", __func__, i, err.what());
 #ifndef NDEBUG
@@ -1534,7 +1589,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
-    const auto gparams = graph_params(res, ubatch, mctx, gtype);
+    auto gparams = graph_params(res, ubatch, mctx, gtype);
+
+    // the list of the last decode, empty for the reserve graphs and for the encoder
+    gparams.logit_tokens = logit_tokens_out.empty() ? nullptr : &logit_tokens_out;
 
     if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
@@ -1613,6 +1671,9 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
 
     // eagle3/DFlash: features as encoder input, and non-draft paths fall back to model's input dim
     const int64_t n_vocab = model.vocab.n_tokens();
+
+    // the logits of the encoder have the whole vocabulary
+    logit_tokens_out.clear();
 
     // note: during encode, we skip position continuity checks and output all tokens
     //       a decoder without memory (see decode()) outputs the marked tokens, unless it extracts embeddings
@@ -1986,6 +2047,13 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         break;
     }
 
+    // the logits of the listed tokens only, this list is used by the graphs of this batch and by the readers of its outputs
+    // the embeddings and the backend samplers need the whole vocabulary
+    logit_tokens_out.clear();
+    if (!logit_tokens.empty() && !output_all && !has_samplers && graph_has_logits) {
+        logit_tokens_out = logit_tokens;
+    }
+
     // reserve output buffer
     if (output_reserve(n_outputs_all) < n_outputs_all) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
@@ -2073,12 +2141,17 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(logits.data != nullptr);
 
-            float * logits_out = logits.data + n_outputs_prev*n_vocab;
+            // a row has the values of the listed tokens only, or the values of the whole vocabulary
+            const int64_t n_logits_row = logit_tokens_out.empty() ? n_vocab : (int64_t) logit_tokens_out.size();
+
+            GGML_ASSERT(logit_tokens_out.empty() || t_logits->ne[0] == n_logits_row);
+
+            float * logits_out = logits.data + n_outputs_prev*n_logits_row;
 
             if (n_outputs) {
                 GGML_ASSERT( n_outputs_prev + n_outputs <= n_outputs_all);
-                GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
-                ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+                GGML_ASSERT((n_outputs_prev + n_outputs)*n_logits_row <= (int64_t) logits.size);
+                ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_logits_row*sizeof(float));
             }
         }
 
@@ -2446,13 +2519,16 @@ void llama_context::output_reorder() {
     const uint64_t n_embd      = model.hparams.n_embd;
     const uint64_t n_embd_out  = model.hparams.n_embd_out();
 
+    // the rows of the logits have the values of the listed tokens only, or the values of the whole vocabulary
+    const uint64_t n_logits_row = logit_tokens_out.empty() ? n_vocab : logit_tokens_out.size();
+
     for (size_t s = 0; s < output_swaps.size(); ++s) {
         const uint64_t i0 = output_swaps[s].i0;
         const uint64_t i1 = output_swaps[s].i1;
 
         if (logits.size > 0) {
-            for (uint64_t k = 0; k < n_vocab; k++) {
-                std::swap(logits.data[i0*n_vocab + k], logits.data[i1*n_vocab + k]);
+            for (uint64_t k = 0; k < n_logits_row; k++) {
+                std::swap(logits.data[i0*n_logits_row + k], logits.data[i1*n_logits_row + k]);
             }
         }
 
@@ -4301,6 +4377,22 @@ float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
     }
 
     return res;
+}
+
+void llama_set_logit_tokens(llama_context * ctx, const llama_token * tokens, size_t n_tokens) {
+    ctx->set_logit_tokens(tokens, n_tokens);
+}
+
+const llama_token * llama_get_logit_tokens(llama_context * ctx, size_t * n_tokens) {
+    ctx->synchronize();
+
+    return ctx->get_logit_tokens(n_tokens);
+}
+
+float * llama_get_logit_tokens_ith(llama_context * ctx, int32_t i) {
+    ctx->synchronize();
+
+    return ctx->get_logit_tokens_ith(i);
 }
 
 float * llama_get_embeddings(llama_context * ctx) {

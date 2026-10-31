@@ -1525,6 +1525,25 @@ extern "C" {
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
 
+    // matrix multiplication that reads only the selected rows of a
+    //
+    //   a:   [k, n_rows]            the rows of a are the left vectors of the dot products
+    //   b:   [k, n_cols]            the columns of b are the right vectors
+    //   ids: [n_cols, n_ids] (I32)  ids[j, i] is the row of a that the column j of b multiplies for the result row i
+    //   result: [n_ids, n_cols]     result[i, j] = dot(a[ids[j, i]], b[:, j])
+    //
+    // the values are the values of ggml_mul_mat(a, b)[ids[j, i], j]
+    // the CUDA backend uses its matrix-vector kernel with one column for each value
+    // for the types of this kernel and up to 4 columns, the sum order is the sum order of ggml_mul_mat
+    //
+    // the same row can be in several columns of ids: this is built with ggml_mul_mat_id and
+    // the backend must accept the duplicates (see TAG_MUL_MAT_ID_DUPLICATE_ID above)
+    GGML_API struct ggml_tensor * ggml_mul_mat_rows(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * ids);
+
     // A: m columns, n rows,
     // B: p columns, n rows,
     // result is m columns, p rows

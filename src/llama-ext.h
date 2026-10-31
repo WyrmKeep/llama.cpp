@@ -164,6 +164,23 @@ LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);
 
+// Compute the logits of the listed tokens only. The next batches of this context have a row of n_tokens values for
+// every output, in the order of the list. The output head reads only the rows of these tokens, and only these values
+// are copied to the host. An empty list (n_tokens == 0) restores the logits of the whole vocabulary.
+// The list is not used when the context outputs embeddings or has backend samplers: the logits have the whole vocabulary then.
+// While a list is in use, llama_get_logits() and llama_get_logits_ith() do not return data. Use the functions below.
+LLAMA_API void llama_set_logit_tokens(struct llama_context * ctx, const llama_token * tokens, size_t n_tokens);
+
+// The tokens of the values in the rows of the last batch, in order. nullptr if the rows have the logits of the whole vocabulary.
+// The pointer is valid until the next batch.
+LLAMA_API const llama_token * llama_get_logit_tokens(struct llama_context * ctx, size_t * n_tokens);
+
+// mirrors:
+// LLAMA_API float * llama_get_logits_ith(struct llama_context * ctx, int32_t i);
+// The row of the output i, with the values of the tokens of llama_get_logit_tokens(). nullptr if the last batch
+// had no list: use llama_get_logits_ith() then.
+LLAMA_API float * llama_get_logit_tokens_ith(struct llama_context * ctx, int32_t i);
+
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
 //

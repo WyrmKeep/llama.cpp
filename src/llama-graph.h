@@ -253,6 +253,27 @@ public:
     const uint32_t n_outputs;
 };
 
+// the tokens whose logits the output head computes, the same list for every output row
+class llm_graph_input_logit_tokens : public llm_graph_input_i {
+public:
+    // gather == false: ids is I32 [n_cols, n_tokens], the list for every column of the head activation
+    // gather == true:  ids is I32 [n_tokens, 1, n_cols], the entries to take from every row of the full logits
+    llm_graph_input_logit_tokens(const std::vector<llama_token> & tokens, int64_t n_cols, bool gather) :
+        tokens(tokens), n_cols(n_cols), gather(gather) {}
+    virtual ~llm_graph_input_logit_tokens() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
+    ggml_tensor * ids = nullptr;
+
+    const std::vector<llama_token> tokens;
+
+    const int64_t n_cols;
+    const bool    gather;
+};
+
 class llm_graph_input_mean : public llm_graph_input_i {
 public:
     llm_graph_input_mean(const llama_cparams & cparams) : cparams(cparams) {}
@@ -834,6 +855,10 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    // the tokens whose logits the head computes, nullptr for all the tokens of the vocabulary
+    // the content is compared by the input of the graph, the list must outlive the graph
+    const std::vector<llama_token> * logit_tokens = nullptr;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -906,7 +931,8 @@ struct llm_graph_params {
             gtype == other.gtype &&
             cvec  == other.cvec  &&
             loras == other.loras &&
-            cross == other.cross;
+            cross == other.cross &&
+            (logit_tokens != nullptr) == (other.logit_tokens != nullptr);
     }
 };
 
@@ -1070,6 +1096,8 @@ struct llm_graph_context {
     const llama_hadamard * hdmd;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
+
+    const std::vector<llama_token> * logit_tokens;
 
     const llm_graph_cb & cb_func;
 
@@ -1459,6 +1487,10 @@ struct llm_graph_context {
     //
 
     void build_logits() const;
+
+    // the logits of the tokens in logit_tokens only, one row of logit_tokens->size() values for every output
+    // the head is computed for these tokens only if its weights allow it, otherwise the rows are taken from the full logits
+    ggml_tensor * build_logits_tokens(ggml_tensor * logits) const;
 
     //
     // sampling (backend sampling)

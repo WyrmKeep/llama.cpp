@@ -3476,6 +3476,40 @@ struct ggml_tensor * ggml_mul_mat_id(
     return result;
 }
 
+// ggml_mul_mat_rows
+
+struct ggml_tensor * ggml_mul_mat_rows(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * ids) {
+    GGML_ASSERT(a->ne[2] == 1 && a->ne[3] == 1);
+    GGML_ASSERT(b->ne[2] == 1 && b->ne[3] == 1);
+    GGML_ASSERT(a->ne[0] == b->ne[0]);
+    GGML_ASSERT(a->nb[0] == ggml_type_size(a->type));
+    GGML_ASSERT(ggml_is_contiguous(b));
+    GGML_ASSERT(b->ne[1] > 0);
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(ids));
+    GGML_ASSERT(ids->ne[0] == b->ne[1] && ids->ne[2] == 1 && ids->ne[3] == 1);
+
+    const int64_t n_cols = b->ne[1];
+    const int64_t n_ids  = ids->ne[1];
+
+    // each row of a is an "expert" with one row, b has one token and the used experts are listed in ids
+    // the token has n_cols columns, the used expert u is multiplied by the column u % n_cols
+    struct ggml_tensor * experts = ggml_view_3d(ctx, a, a->ne[0], 1, a->ne[1], a->nb[1], a->nb[1], 0);
+    struct ggml_tensor * token   = ggml_reshape_3d(ctx, b, b->ne[0], n_cols, 1);
+    struct ggml_tensor * used    = ggml_reshape_2d(ctx, ids, n_cols*n_ids, 1);
+
+    // [1, n_ids*n_cols, 1], the value (i, j) is at i*n_cols + j
+    struct ggml_tensor * cur = ggml_mul_mat_id(ctx, experts, token, used);
+
+    cur = ggml_reshape_2d(ctx, cur, n_cols, n_ids);
+
+    return ggml_cont(ctx, ggml_transpose(ctx, cur));
+}
+
 // ggml_out_prod
 
 static inline bool ggml_can_out_prod(const struct ggml_tensor * t0, const struct ggml_tensor * t1) {
