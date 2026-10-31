@@ -17,6 +17,7 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
+#include <atomic>
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -4337,7 +4338,11 @@ ggml_tensor * llm_graph_context::build_logits_tokens(ggml_tensor * logits) const
 
         cur = ggml_mul_mat_rows(ctx0, logits->src[0], x, inp->ids);
 
-        LLAMA_LOG_DEBUG("%s: the head reads the rows of %d tokens for %d output rows\n", __func__, (int) n_lt, (int) n_rows);
+        // one line in the log of the process, to show which head the graphs have
+        static std::atomic<bool> logged_rows(false);
+        if (!logged_rows.exchange(true)) {
+            LLAMA_LOG_INFO("%s: the head reads the rows of %d tokens for %d output rows (more graphs of this kind follow)\n", __func__, (int) n_lt, (int) n_rows);
+        }
 
         res->add_input(std::move(inp));
     } else {
@@ -4356,7 +4361,10 @@ ggml_tensor * llm_graph_context::build_logits_tokens(ggml_tensor * logits) const
         cur = ggml_get_rows(ctx0, ggml_reshape_4d(ctx0, logits, 1, logits->ne[0], 1, n_rows), inp->ids);
         cur = ggml_reshape_2d(ctx0, cur, n_lt, n_rows);
 
-        LLAMA_LOG_DEBUG("%s: the full head, then the values of %d tokens for %d output rows\n", __func__, (int) n_lt, (int) n_rows);
+        static std::atomic<bool> logged_full(false);
+        if (!logged_full.exchange(true)) {
+            LLAMA_LOG_INFO("%s: the full head, then the values of %d tokens for %d output rows (more graphs of this kind follow)\n", __func__, (int) n_lt, (int) n_rows);
+        }
 
         res->add_input(std::move(inp));
     }
