@@ -273,6 +273,134 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 }
 
+// Weight tile pipeline for Q4_0 (change 0009, see mul_mat_q_process_tile).
+// ggml_cuda_mmq_stage_tiles_q4_0 copies the raw blocks of one k step of the weight tile (I rows of 8 blocks, 144 bytes each) from VRAM into x_stage
+// with cp.async. ggml_cuda_mmq_unstage_tiles_q4_0 then does what ggml_cuda_mmq_load_tiles_q4_0 does, with x_stage as the source.
+#include "cp-async.cuh"
+
+template <ggml_type type, int J> static __device__ __forceinline__ void ggml_cuda_mmq_stage_tiles_q4_0(
+        const char * __restrict__ x, int * __restrict__ x_stage, const int kbx0, const int stride) {
+#if defined(GGML_CUDA_MMQ_WEIGHT_PIPE)
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int nthreads  = ggml_cuda_mmq_get_nthreads(type, J, false, GGML_PREC_Q8);
+    constexpr int I         = ggml_cuda_mmq_get_I(type, J, false, GGML_PREC_Q8);
+
+    constexpr int bytes_per_row = (MMQ_ITER_K / QK4_0) * sizeof(block_q4_0);
+    static_assert(bytes_per_row % 16 == 0, "the raw blocks of a row must be a multiple of 16 bytes");
+    constexpr int chunks_per_row = bytes_per_row / 16;
+    constexpr int nchunks        = I * chunks_per_row;
+
+    const unsigned int dst0 = (unsigned int) __cvta_generic_to_shared(x_stage);
+    const int tid = threadIdx.y*warp_size + threadIdx.x;
+
+#pragma unroll
+    for (int c0 = 0; c0 < nchunks; c0 += nthreads) {
+        const int c = c0 + tid;
+        if (nchunks % nthreads == 0 || c < nchunks) {
+            const int i = c / chunks_per_row;
+            const int k = c % chunks_per_row;
+            const char * src = (const char *) ((const block_q4_0 *) x + kbx0 + (int64_t) i*stride) + 16*k;
+            cp_async_cg_16<0>(dst0 + 16*c, src);
+        }
+    }
+#else
+    GGML_UNUSED_VARS(x, x_stage, kbx0, stride);
+    NO_DEVICE_CODE;
+#endif // defined(GGML_CUDA_MMQ_WEIGHT_PIPE)
+}
+
+template <ggml_type type, int J> static __device__ __forceinline__ void ggml_cuda_mmq_unstage_tiles_q4_0(
+        const int * __restrict__ x_stage, int * __restrict__ x_tile) {
+#if defined(GGML_CUDA_MMQ_WEIGHT_PIPE)
+    constexpr int warp_size   = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps      = ggml_cuda_mmq_get_nthreads(type, J, false, GGML_PREC_Q8) / warp_size;
+    constexpr int I           = ggml_cuda_mmq_get_I(type, J, false, GGML_PREC_Q8);
+    constexpr int sram_stride = ggml_cuda_mmq_get_sram_stride(type, J, false, GGML_PREC_Q8);
+
+    int   * x_qs = (int   *)  x_tile;
+    float * x_df = (float *) (x_qs + 2*MMQ_TILE_NE_K);
+
+    constexpr int bytes_per_row = (MMQ_ITER_K / QK4_0) * sizeof(block_q4_0);
+    const char * stage = (const char *) x_stage;
+
+    constexpr int threads_per_row = MMQ_ITER_K / (4 * QR4_0);
+    constexpr int nrows = warp_size / threads_per_row;
+    const int txi = warp_size > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
+    const int kbx  = txi / QI4_0;
+    const int kqsx = txi % QI4_0;
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nrows*nwarps) {
+        const int i = i0 + (nrows == 1 ? threadIdx.y : threadIdx.y*nrows + threadIdx.x/threads_per_row);
+
+        const block_q4_0 * bxi = (const block_q4_0 *) (stage + i*bytes_per_row) + kbx;
+        const int qs0 = get_int_b2(bxi->qs, kqsx);
+
+        x_qs[i*sram_stride + kbx*(2*QI4_0) + kqsx + 0]     = __vsub4((qs0 >> 0) & 0x0F0F0F0F, 0x08080808);
+        x_qs[i*sram_stride + kbx*(2*QI4_0) + kqsx + QI4_0] = __vsub4((qs0 >> 4) & 0x0F0F0F0F, 0x08080808);
+    }
+
+    constexpr int blocks_per_tile_x_row = MMQ_TILE_NE_K / QI4_0;
+    constexpr int rows_per_warp = warp_size / blocks_per_tile_x_row;
+    const int kbxd = threadIdx.x % blocks_per_tile_x_row;
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += nwarps * rows_per_warp) {
+        const int i = i0 + threadIdx.y * rows_per_warp + threadIdx.x / blocks_per_tile_x_row;
+
+        const block_q4_0 * bxi = (const block_q4_0 *) (stage + i*bytes_per_row) + kbxd;
+
+        x_df[i*sram_stride + kbxd] = bxi->d;
+    }
+#else
+    GGML_UNUSED_VARS(x_stage, x_tile);
+    NO_DEVICE_CODE;
+#endif // defined(GGML_CUDA_MMQ_WEIGHT_PIPE)
+}
+
+// cp.async groups. Each thread commits the copies that it issued since its last commit as one group.
+static __device__ __forceinline__ void ggml_cuda_mmq_cp_async_commit() {
+#if defined(GGML_CUDA_MMQ_WEIGHT_PIPE)
+    asm volatile("cp.async.commit_group;");
+#else
+    NO_DEVICE_CODE;
+#endif // defined(GGML_CUDA_MMQ_WEIGHT_PIPE)
+}
+
+// Waits until all groups of the thread but the newest one are complete.
+static __device__ __forceinline__ void ggml_cuda_mmq_cp_async_wait_group_1() {
+#if defined(GGML_CUDA_MMQ_WEIGHT_PIPE)
+    asm volatile("cp.async.wait_group 1;");
+#else
+    NO_DEVICE_CODE;
+#endif // defined(GGML_CUDA_MMQ_WEIGHT_PIPE)
+}
+
+// Copies one half of the activation tile (J columns of one block_q8_1_mmq, 144 bytes each, J*MMQ_TILE_Y_K ints) from VRAM to y_tile with cp.async.
+template <ggml_type type, int J> static __device__ __forceinline__ void ggml_cuda_mmq_stage_y(const int * __restrict__ y_half, int * __restrict__ y_tile) {
+#if defined(GGML_CUDA_MMQ_WEIGHT_PIPE)
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int nthreads  = ggml_cuda_mmq_get_nthreads(type, J, false, GGML_PREC_Q8);
+
+    static_assert((J*MMQ_TILE_Y_K) % 4 == 0, "the activation tile must be a multiple of 16 bytes");
+    constexpr int nchunks = J*MMQ_TILE_Y_K / 4;
+
+    const unsigned int dst0 = (unsigned int) __cvta_generic_to_shared(y_tile);
+    const int tid = threadIdx.y*warp_size + threadIdx.x;
+
+#pragma unroll
+    for (int c0 = 0; c0 < nchunks; c0 += nthreads) {
+        const int c = c0 + tid;
+        if (nchunks % nthreads == 0 || c < nchunks) {
+            cp_async_cg_16<0>(dst0 + 16*c, y_half + 4*c);
+        }
+    }
+#else
+    GGML_UNUSED_VARS(y_half, y_tile);
+    NO_DEVICE_CODE;
+#endif // defined(GGML_CUDA_MMQ_WEIGHT_PIPE)
+}
+
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_q4_1(
         const char * __restrict__ x, const char * __restrict__ x_gate, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
     GGML_UNUSED(x_gate);

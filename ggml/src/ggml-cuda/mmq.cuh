@@ -432,6 +432,35 @@ static __host__ int ggml_cuda_mmq_get_nbytes_shared_x(const ggml_cuda_mmq_config
     return (txs.qs + txs.dm + txs.sc) * 4;
 }
 
+// Tile load pipeline (change 0009): Q4_0 on Ampere and Ada. The device code uses cp.async, which is available from compute capability 8.0.
+#if defined(TURING_MMA_AVAILABLE) && defined(CP_ASYNC_AVAILABLE) && __CUDA_ARCH__ < 900 && !defined(GGML_CUDA_MMQ_NO_WEIGHT_PIPE)
+#define GGML_CUDA_MMQ_WEIGHT_PIPE
+#endif
+
+static constexpr __host__ __device__ bool ggml_cuda_mmq_weight_pipe_type(const ggml_type type) {
+    return type == GGML_TYPE_Q4_0;
+}
+
+// Whether the kernels for the compute capability have the pipeline. This must agree with GGML_CUDA_MMQ_WEIGHT_PIPE.
+static __host__ bool ggml_cuda_mmq_weight_pipe_cc(const int cc) {
+#if defined(GGML_CUDA_MMQ_NO_WEIGHT_PIPE)
+    GGML_UNUSED(cc);
+    return false;
+#else
+    return cc >= GGML_CUDA_CC_AMPERE && cc < GGML_CUDA_CC_HOPPER;
+#endif // defined(GGML_CUDA_MMQ_NO_WEIGHT_PIPE)
+}
+
+// Bytes of shared memory after the weight tile for the pipeline: the raw blocks of one k step of the weight tile and the second activation tile.
+static __host__ int ggml_cuda_mmq_get_nbytes_stage(const ggml_cuda_mmq_config & config, const int cc) {
+    if (ggml_cuda_mmq_weight_pipe_type(config.type) && !config.fallback && config.use_mma_data_layout(cc) && ggml_cuda_mmq_weight_pipe_cc(cc)) {
+        const int nbs_w = config.I * (MMQ_ITER_K / QK4_0) * (int) sizeof(block_q4_0);
+        const int nbs_y = GGML_PAD(config.J * (int) sizeof(block_q8_1_mmq), config.nthreads * (int) sizeof(int));
+        return nbs_w + nbs_y;
+    }
+    return 0;
+}
+
 // ------------------------------------------------------------
 
 // Weight types with a fused gate/up/GLU path (see ggml_cuda_mmq_get_util_funcs).
@@ -951,39 +980,99 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
     constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);
 
-    for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
-        load_tiles(x, x_gate, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
-        {
-            const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
-#pragma unroll
-            for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
-                int l = l0 + threadIdx.y*warp_size + threadIdx.x;
+#if defined(GGML_CUDA_MMQ_WEIGHT_PIPE)
+    constexpr bool pipe = ggml_cuda_mmq_weight_pipe_type(type) && !fallback && !has_fusion;
+#else
+    constexpr bool pipe = false;
+#endif // defined(GGML_CUDA_MMQ_WEIGHT_PIPE)
 
-                tile_y[l] = by0[l];
-            }
+    // Tile load pipeline (Q4_0): cp.async copies the raw weight blocks and the two halves of the activation tile of the next k step
+    // into shared memory while the MMA work of this k step runs, so the wait for the loads is not on the critical path.
+    // The weight tile and the activation tiles that the MMA work reads are the same as without the pipeline, so the sums are the same.
+    // cp.async copies 16 bytes, so the blocks must start on a multiple of 16 bytes (8 blocks of Q4_0 are 144 bytes, a column of the activations 144 bytes).
+    // mul_mat_q_case uses the fallback kernel, which has no pipeline, when the weights or the activations are not aligned this way.
+    if constexpr (pipe) {
+        int * x_stage = tile_x + I*ggml_cuda_mmq_get_sram_stride(type, J, fallback, prec_src1); // raw blocks of the weight tile of the next k step
+        int * tile_y1 = x_stage + I*((MMQ_ITER_K / QK4_0) * sizeof(block_q4_0) / sizeof(int));  // activation tile of the second half of the k step
+
+        if (kb0_start < kb0_stop) {
+            const int * by0 = y + ncols_y * (kb0_start * qk / ne_block) * sz;
+            ggml_cuda_mmq_stage_tiles_q4_0<type, J>(x, x_stage, offset_x + kb0_start, stride_row_x);
+            ggml_cuda_mmq_stage_y<type, J>(by0, tile_y);
+            ggml_cuda_mmq_stage_y<type, J>(by0 + ncols_y * sz, tile_y1);
+            cp_async_wait_all();
+            __syncthreads();
         }
 
-        __syncthreads();
+        // Each commit makes a group, also an empty one, so that the groups that wait_group leaves outstanding are known.
+        for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
+            const bool next = kb0 + blocks_per_iter < kb0_stop;
+            const int * by_next = y + ncols_y * ((kb0 + blocks_per_iter) * qk / ne_block) * sz;
 
-        vec_dot(tile_x, tile_y, sum, 0);
+            ggml_cuda_mmq_unstage_tiles_q4_0<type, J>(x_stage, tile_x);
 
-        __syncthreads();
+            __syncthreads(); // the weight tile is complete and x_stage is free
 
-        {
-            const int * by0 = y + ncols_y * ((kb0 * qk / ne_block) * sz + sz);
-#pragma unroll
-            for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
-                int l = l0 + threadIdx.y*warp_size + threadIdx.x;
-
-                tile_y[l] = by0[l];
+            if (next) {
+                ggml_cuda_mmq_stage_tiles_q4_0<type, J>(x, x_stage, offset_x + kb0 + blocks_per_iter, stride_row_x);
             }
+            ggml_cuda_mmq_cp_async_commit();
+
+            vec_dot(tile_x, tile_y, sum, 0);
+
+            ggml_cuda_mmq_cp_async_wait_group_1(); // the second half of this k step has arrived
+            __syncthreads();                       // and tile_y is free
+
+            if (next) {
+                ggml_cuda_mmq_stage_y<type, J>(by_next, tile_y);
+            }
+            ggml_cuda_mmq_cp_async_commit();
+
+            vec_dot(tile_x, tile_y1, sum, MMQ_TILE_NE_K);
+
+            cp_async_wait_all(); // the weights and the first half of the next k step have arrived
+            __syncthreads();     // and the weight tile and tile_y1 are free
+
+            if (next) {
+                ggml_cuda_mmq_stage_y<type, J>(by_next + ncols_y * sz, tile_y1);
+            }
+            ggml_cuda_mmq_cp_async_commit();
         }
+    } else {
+        for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
+            load_tiles(x, x_gate, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
+            {
+                const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
+#pragma unroll
+                for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
+                    int l = l0 + threadIdx.y*warp_size + threadIdx.x;
 
-        __syncthreads();
+                    tile_y[l] = by0[l];
+                }
+            }
 
-        vec_dot(tile_x, tile_y, sum, MMQ_TILE_NE_K);
+            __syncthreads();
 
-        __syncthreads();
+            vec_dot(tile_x, tile_y, sum, 0);
+
+            __syncthreads();
+
+            {
+                const int * by0 = y + ncols_y * ((kb0 * qk / ne_block) * sz + sz);
+#pragma unroll
+                for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
+                    int l = l0 + threadIdx.y*warp_size + threadIdx.x;
+
+                    tile_y[l] = by0[l];
+                }
+            }
+
+            __syncthreads();
+
+            vec_dot(tile_x, tile_y, sum, MMQ_TILE_NE_K);
+
+            __syncthreads();
+        }
     }
 
     if (fixup) {
@@ -1446,7 +1535,7 @@ static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const i
     const size_t nbs_ids = config.J*sizeof(int);
     const size_t nbs_x = ggml_cuda_mmq_get_nbytes_shared_x(config, cc);
     const size_t nbs_y = config.J * (sizeof(block_q8_1_mmq));
-    return nbs_ids + nbs_x + GGML_PAD(nbs_y, config.nthreads*sizeof(int));
+    return nbs_ids + nbs_x + GGML_PAD(nbs_y, config.nthreads*sizeof(int)) + ggml_cuda_mmq_get_nbytes_stage(config, cc);
 }
 
 template <ggml_type type, int J, bool fallback, ggml_prec prec_src1, bool has_fusion>
@@ -1607,9 +1696,27 @@ static void mul_mat_q_switch_fusion(ggml_backend_cuda_context & ctx, const mmq_a
     mul_mat_q_switch_J<type, fallback, prec_src1, false>(ctx, args, stream);
 }
 
+// The pipeline (see mul_mat_q_process_tile) copies the weights and the activations in chunks of 16 bytes, so it needs these alignments:
+// 8 blocks of the weights (a multiple of 16 bytes for Q4_0) at the start of a row, a channel and a sample, and the activations at 16 bytes.
+template <ggml_type type>
+static bool ggml_cuda_mmq_weight_pipe_args_ok(const mmq_args & args) {
+    if constexpr (ggml_cuda_mmq_weight_pipe_type(type)) {
+        constexpr int blocks_per_iter = MMQ_ITER_K / QK4_0;
+        if (!ggml_cuda_mmq_weight_pipe_cc(ggml_cuda_info().devices[ggml_cuda_get_device()].cc)) {
+            return true; // the kernel has no pipeline
+        }
+        return (reinterpret_cast<uintptr_t>(args.x) & 15) == 0 && (reinterpret_cast<uintptr_t>(args.y) & 15) == 0
+            && args.stride_row_x % blocks_per_iter == 0 && args.stride_channel_x % blocks_per_iter == 0 && args.stride_sample_x % blocks_per_iter == 0
+            && args.stride_channel_y % 4 == 0 && args.stride_sample_y % 4 == 0;
+    } else {
+        GGML_UNUSED(args);
+        return true;
+    }
+}
+
 template <ggml_type type, ggml_prec prec_src1>
 void mul_mat_q_case(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
-    if (ggml_cuda_mmq_needs_fallback(args.nrows_x)) {
+    if (ggml_cuda_mmq_needs_fallback(args.nrows_x) || !ggml_cuda_mmq_weight_pipe_args_ok<type>(args)) {
         constexpr bool fallback = true;
         mul_mat_q_switch_fusion<type, fallback, prec_src1>(ctx, args, stream);
     } else {
