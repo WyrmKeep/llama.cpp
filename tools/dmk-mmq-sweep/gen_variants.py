@@ -9,6 +9,8 @@ Rounds:
   r1   the first sweep: three block shapes, J from 8 to 128, Q4_0 and Q8_0, no fallback
   t0   a trial of three variants for the build script
   fb   the fallback table (a number of weight rows that is not a multiple of 128): J of 8, 16, 32, 64 and 128
+  ab   the baseline table (256 threads, one block for each SM, I of 128, J from 8 to 128) and, for each J, three ablations of the loads
+       of the k loop (SWEEP_ABL 1: no weight load, 2: no activation load, 3: neither). The ablations are timing only, the result is wrong.
 """
 import sys
 import os
@@ -37,8 +39,12 @@ def configs_t0():
     yield (256, 128, 2, [64])
     yield (128, 64, 3, [64])
 
-gens = {"r1": configs_r1, "fb": configs_fb, "t0": configs_t0}
-fallbacks = {"r1": [0], "fb": [1], "t0": [0]}
+def configs_ab():
+    yield (256, 128, 1, J_ALL)
+
+gens = {"r1": configs_r1, "fb": configs_fb, "t0": configs_t0, "ab": configs_ab}
+fallbacks = {"r1": [0], "fb": [1], "t0": [0], "ab": [0]}
+ablations = {"r1": [0], "fb": [0], "t0": [0], "ab": [0, 1, 2, 3]}
 
 rows = []
 for nt, I, occ, js in gens[R]():
@@ -47,14 +53,15 @@ for nt, I, occ, js in gens[R]():
         for J in js:
             for sk in (1,):
                 for fb in fallbacks[R]:
-                    name = f"{t[:2].lower()}{t[3]}_nt{nt}_o{occ}_I{I}_J{J}_s{sk}_f{fb}"
-                    rows.append((name, t, nt, occ, I, J, sk, fb))
+                    for abl in ablations[R]:
+                        name = f"{t[:2].lower()}{t[3]}_nt{nt}_o{occ}_I{I}_J{J}_s{sk}_f{fb}" + (f"_abl{abl}" if abl else "")
+                        rows.append((name, t, nt, occ, I, J, sk, fb, abl))
 
 with open(os.path.join(out, "variants.inc"), "w") as f:
-    for name, t, nt, occ, I, J, sk, fb in rows:
+    for name, t, nt, occ, I, J, sk, fb, abl in rows:
         f.write(f"VARIANT({name}, GGML_TYPE_{t}, {nt}, {occ}, {I}, {J}, {sk}, {fb})\n")
 with open(os.path.join(out, "variants.tsv"), "w") as f:
-    f.write("name\ttype\tnt\tocc\tI\tJ\tstreamk\tfallback\n")
+    f.write("name\ttype\tnt\tocc\tI\tJ\tstreamk\tfallback\tablation\n")
     for r in rows:
         f.write("\t".join(str(x) for x in r) + "\n")
 print(f"{len(rows)} variants")

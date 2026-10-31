@@ -18,6 +18,12 @@ extern int g_sweep_last_fixup;
 extern int g_sweep_last_ntiles;
 extern int g_sweep_last_bps;
 
+// SWEEP only: timing ablation of the loads of the k loop. Bit 0 skips the weight tile load, bit 1 skips the activation tile loads,
+// after the first iteration of a block. The result is wrong. 0 is the code of the build.
+#ifndef SWEEP_ABL
+#define SWEEP_ABL 0
+#endif
+
 typedef void (*ggml_cuda_mmq_load_tiles_t)(const char * __restrict__ x, const char * __restrict__ x_gate, int * x_tile,
     const int kbx0, const int i_max, const int stride);
 typedef void (*ggml_cuda_mmq_vec_dot_t)(const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00);
@@ -963,7 +969,15 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);
 
     for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
-        load_tiles(x, x_gate, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
+#if SWEEP_ABL & 1
+        if (kb0 == kb0_start) // SWEEP ablation (timing only, the result is wrong): the weight tile is loaded in the first iteration only
+#endif
+        {
+            load_tiles(x, x_gate, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
+        }
+#if SWEEP_ABL & 2
+        if (kb0 == kb0_start) // SWEEP ablation (timing only, the result is wrong): the activation tile is loaded in the first iteration only
+#endif
         {
             const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
 #pragma unroll
@@ -980,6 +994,9 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
         __syncthreads();
 
+#if SWEEP_ABL & 2
+        if (kb0 == kb0_start)
+#endif
         {
             const int * by0 = y + ncols_y * ((kb0 * qk / ne_block) * sz + sz);
 #pragma unroll

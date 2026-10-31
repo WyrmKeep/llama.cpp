@@ -191,7 +191,7 @@ int main(int argc, char ** argv) {
     std::string variants_s = "";
     std::string policies_s = "0";
     double reps_ms = 15.0;
-    int trials = 3, check = 1, list = 0;
+    int trials = 3, check = 1, list = 0, j_baseline_only = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
         auto val = [&]() -> std::string { if (i + 1 >= argc) { fprintf(stderr, "missing value for %s\n", a.c_str()); exit(2); } return argv[++i]; };
@@ -202,6 +202,7 @@ int main(int argc, char ** argv) {
         else if (a == "--reps-ms")  reps_ms = atof(val().c_str());
         else if (a == "--trials")   trials = atoi(val().c_str());
         else if (a == "--check")    check = atoi(val().c_str());
+        else if (a == "--j-baseline-only") j_baseline_only = atoi(val().c_str()); // 1: run a variant only at the J of the baseline of the cell
         else if (a == "--list")     list = 1;
         else if (a == "sweep")      { /* the harness is started as `llama sweep ...`: ignore the command */ }
         else { fprintf(stderr, "unknown argument %s\n", a.c_str()); return 2; }
@@ -320,13 +321,15 @@ int main(int argc, char ** argv) {
             std::vector<int> order;
             for (size_t v = 0; v < g_variants.size(); ++v) { order.push_back((int) v); }
             auto is_baseline = [&](const Variant & v) {
-                return v.type == sh.type && v.nt == 256 && v.occ == 1 && v.I == 128 && v.streamk == 1 && v.J == Jb && (v.fallback != 0) == fallback;
+                return v.type == sh.type && v.nt == 256 && v.occ == 1 && v.I == 128 && v.streamk == 1 && v.J == Jb && (v.fallback != 0) == fallback
+                       && strstr(v.name, "_abl") == nullptr; // an ablation variant is never the baseline
             };
             std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return is_baseline(g_variants[a]) && !is_baseline(g_variants[b]); });
 
             for (int vi : order) {
                 Variant & v = g_variants[vi];
                 if (v.type != sh.type || (v.fallback != 0) != fallback || !v.launchable) { continue; }
+                if (j_baseline_only && v.J != Jb) { continue; }
                 if (!vsel.empty() && !is_baseline(v)) {
                     bool ok = false;
                     for (auto & s : vsel) { if (strstr(v.name, s.c_str())) { ok = true; } }

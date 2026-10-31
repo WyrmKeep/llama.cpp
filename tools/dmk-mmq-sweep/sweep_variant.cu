@@ -9,6 +9,7 @@
 //   SWEEP_FALLBACK  0 or 1 (1 is for a number of weight rows that is not a multiple of 128)
 //   SWEEP_NAME      suffix of the two functions that this file defines
 //   SWEEP_LAYOUT    shared memory layout of the weights (GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0)
+//   SWEEP_ABL       timing ablation of the loads of the k loop (0 none, 1 no weight load, 2 no activation load, 3 neither); default 0
 //
 // The file includes the MMQ code of the patched tree (mmq-config-sweep.cuh gives the one config entry),
 // so the kernel is the kernel of the build, with another tile configuration.

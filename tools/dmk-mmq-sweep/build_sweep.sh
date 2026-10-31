@@ -19,13 +19,13 @@ if [[ "${1:-}" == "--inside" ]]; then
            -I/src/ggml/src/ggml-cuda -I/src/ggml/src -I/src/ggml/include -I"$out" -w -Xptxas -v)
     cat > "$out/compile_one.sh" <<EOF
 #!/usr/bin/env bash
-# compile_one.sh name type nt occ I J streamk fallback
+# compile_one.sh name type nt occ I J streamk fallback [ablation]
 set -euo pipefail
-name=\$1 type=\$2 nt=\$3 occ=\$4 I=\$5 J=\$6 sk=\$7 fb=\$8
+name=\$1 type=\$2 nt=\$3 occ=\$4 I=\$5 J=\$6 sk=\$7 fb=\$8 abl=\${9:-0}
 [[ -f $out/obj/\$name.o ]] && exit 0
 nvcc ${flags[*]} -c /sweep/sweep_variant.cu -o $out/obj/\$name.o \\
   -DSWEEP_NAME=\$name -DSWEEP_TYPE=GGML_TYPE_\$type -DSWEEP_NT=\$nt -DSWEEP_OCC=\$occ -DSWEEP_I=\$I -DSWEEP_J=\$J \\
-  -DSWEEP_STREAMK=\$sk -DSWEEP_FALLBACK=\$fb -DSWEEP_LAYOUT=GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0 \\
+  -DSWEEP_STREAMK=\$sk -DSWEEP_FALLBACK=\$fb -DSWEEP_ABL=\$abl -DSWEEP_LAYOUT=GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0 \\
   > $out/obj/\$name.log 2>&1 || { echo "FAILED \$name"; exit 1; }
 echo "ok \$name"
 EOF
