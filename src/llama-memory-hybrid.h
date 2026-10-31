@@ -83,11 +83,17 @@ public:
     llama_kv_cache * get_mem_attn() const;
     llama_memory_recurrent * get_mem_recr() const;
 
+    // let the ubatches hold sequence sets with different token counts (see llama_ubatch::seq_len)
+    //   only for models whose graph and backends can run them
+    void set_ragged(bool ragged);
+
 private:
     const llama_hparams & hparams;
 
     const std::unique_ptr<llama_kv_cache> mem_attn;
     const std::unique_ptr<llama_memory_recurrent> mem_recr;
+
+    bool ragged = false;
 };
 
 class llama_memory_hybrid_context : public llama_memory_context_i {

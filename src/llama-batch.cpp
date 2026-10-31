@@ -616,7 +616,7 @@ llama_ubatch llama_batch_allocr::split_simple(uint32_t n_ubatch) {
     return ubatch_add(idxs, idxs.size(), false);
 }
 
-llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail) {
+llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential, uint32_t n_keep_tail, uint32_t n_ragged_step) {
     if (sequential && has_cpl) {
         LLAMA_LOG_ERROR("%s: sequential split is not supported when there are coupled sequences in the input batch (you may need to use the -kvu flag)\n", __func__);
 
@@ -672,6 +672,51 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
     for (uint32_t s = 0; s < n_seqs; ++s) {
         while (used[seq_set_map[cur_seq_set[s]][cur_idx[s]]]) {
             ++cur_idx[s];
+        }
+    }
+
+    // sequence sets with different numbers of new tokens that fit in one ubatch: one ragged ubatch with all of them
+    //   replaces one ubatch for each distinct length, and the weights are read once instead of once for each
+    //   the recurrent layers have to run the longer sets one token at a time, so ragged ubatches are only
+    //   made when every length step (from 0 up to the longest set) is short
+    if (n_ragged_step > 0 && n_seqs > 1 && n_keep_tail == 0 && !sequential && !has_cpl) {
+        std::vector<int32_t> seq_len(n_seqs);
+
+        uint32_t n_total = 0;
+        bool     single  = true;
+
+        for (uint32_t s = 0; s < n_seqs; ++s) {
+            seq_len[s] = (int32_t) seq_set_map[cur_seq_set[s]].size() - cur_idx[s];
+            n_total   += seq_len[s];
+            single    &= cur_seq_set[s].count() == 1;
+        }
+
+        std::vector<int32_t> sorted(seq_len);
+        std::sort(sorted.begin(), sorted.end());
+
+        int32_t max_step = sorted[0];
+        for (uint32_t s = 1; s < n_seqs; ++s) {
+            max_step = std::max(max_step, sorted[s] - sorted[s - 1]);
+        }
+
+        if (single && n_total <= n_ubatch && sorted.front() != sorted.back() && max_step <= (int32_t) n_ragged_step) {
+            std::vector<int32_t> idxs;
+            idxs.reserve(n_total);
+
+            for (uint32_t s = 0; s < n_seqs; ++s) {
+                const auto & seq_idxs = seq_set_map[cur_seq_set[s]];
+
+                for (; cur_idx[s] < (int32_t) seq_idxs.size(); ++cur_idx[s]) {
+                    const int32_t idx = seq_idxs[cur_idx[s]];
+
+                    idxs.push_back(idx);
+
+                    used[idx] = true;
+                    ++n_used;
+                }
+            }
+
+            return ubatch_add(idxs, n_seqs, false, &seq_len);
         }
     }
 
@@ -861,10 +906,11 @@ void llama_batch_allocr::clear() {
     std::fill(seq_idx.begin(), seq_idx.end(), -1);
 }
 
-llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, uint32_t n_seqs, bool equal_seqs) {
+llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, uint32_t n_seqs, bool equal_seqs, const std::vector<int32_t> * seq_len) {
     const uint32_t n_tokens = idxs.size();
 
-    assert(n_tokens%n_seqs == 0);
+    assert(seq_len || n_tokens%n_seqs == 0);
+    assert(!seq_len || (!equal_seqs && seq_len->size() == n_seqs));
 
     auto udata = std::make_shared<llama_ubatch::data_t>();
 
@@ -897,6 +943,9 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
     udata->output    .resize(n_tokens);
     udata->type      .resize(mixed ? n_tokens : 0);
     udata->decision_order.resize(decision_order.empty() ? 0 : n_tokens);
+    if (seq_len) {
+        udata->seq_len = *seq_len;
+    }
 
     udata->batch_idxs = idxs;
     udata->seq_id_data.reserve(n_tokens);
@@ -956,10 +1005,13 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         }
     }
 
+    // taken before udata is moved into the ubatch
+    int32_t * seq_len_ptr = seq_len ? udata->seq_len.data() : nullptr;
+
     llama_ubatch res {
         /*.b_equal_seqs =*/ equal_seqs,
         /*.n_tokens     =*/ n_tokens,
-        /*.n_seq_tokens =*/ n_tokens/n_seqs,
+        /*.n_seq_tokens =*/ seq_len ? 0 : n_tokens/n_seqs,
         /*.n_seqs       =*/ n_seqs,
         /*.n_seqs_unq   =*/ (uint32_t) udata->seq_id_unq.size(),
         /*.n_pos        =*/ n_pos_per_embd,
@@ -976,6 +1028,7 @@ llama_ubatch llama_batch_allocr::ubatch_add(const std::vector<int32_t> & idxs, u
         /*.type         =*/ mixed ? udata->type.data() : nullptr,
         /*.decision_order =*/ udata->decision_order.empty() ? nullptr : udata->decision_order.data(),
         /*.data         =*/ std::move(udata),
+        /*.seq_len      =*/ seq_len_ptr,
     };
 
     if (debug > 0) {
@@ -994,6 +1047,17 @@ void llama_batch_allocr::ubatch_print(const llama_ubatch & ubatch, int debug) {
         LLAMA_LOG_DEBUG("%s:   n_seq_tokens = %d\n", __func__, ubatch.n_seq_tokens);
         LLAMA_LOG_DEBUG("%s:   n_seqs       = %d\n", __func__, ubatch.n_seqs);
         LLAMA_LOG_DEBUG("%s:   n_seqs_unq   = %d\n", __func__, ubatch.n_seqs_unq);
+
+        if (ubatch.ragged()) {
+            std::stringstream ss_seq_len;
+            ss_seq_len << "[ ";
+            for (uint32_t s = 0; s < ubatch.n_seqs; ++s) {
+                ss_seq_len << ubatch.seq_len[s] << " ";
+            }
+            ss_seq_len << "]";
+
+            LLAMA_LOG_DEBUG("%s:   seq_len      = %s\n", __func__, ss_seq_len.str().c_str());
+        }
 
         std::stringstream ss_seq_id_unq;
         std::stringstream ss_seq_idx;

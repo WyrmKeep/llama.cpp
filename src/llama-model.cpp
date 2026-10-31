@@ -2804,6 +2804,72 @@ ggml_tensor * llama_model::get_rope_factors(const llama_cparams & cparams, int i
     return layers[il].rope_short;
 }
 
+// the recurrent layers can run a ubatch whose sequence sets have different token counts (see llama_ubatch::seq_len):
+//   the graph builds the ragged ops, and the device of every recurrent layer supports them
+static bool llama_model_supports_ragged(const llama_model & model) {
+    const auto & hparams = model.hparams;
+
+    // only the Qwen3.5 graph builds the ragged ops
+    if (model.arch != LLM_ARCH_QWEN35) {
+        return false;
+    }
+
+    const int64_t d_conv      = hparams.ssm_d_conv;
+    const int64_t head_k_dim  = hparams.ssm_d_state;
+    const int64_t num_k_heads = hparams.ssm_n_group;
+    const int64_t num_v_heads = hparams.ssm_dt_rank;
+    const int64_t head_v_dim  = hparams.ssm_d_inner / num_v_heads;
+    const int64_t conv_dim    = hparams.ssm_d_inner + 2*num_k_heads*head_k_dim;
+
+    // probe ops for two sequence sets with 3 and 1 tokens
+    const int64_t n_tokens = 4;
+    const int64_t n_seqs   = 2;
+
+    ggml_init_params params = {
+        /*.mem_size   =*/ ggml_tensor_overhead()*32,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+
+    ggml_context * ctx = ggml_init(params);
+    if (ctx == nullptr) {
+        return false;
+    }
+
+    ggml_tensor * seq_off = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs + 1);
+
+    ggml_tensor * conv = ggml_ssm_conv_ragged(ctx,
+            ggml_new_tensor_3d(ctx, GGML_TYPE_F32, d_conv - 1, conv_dim, n_seqs),
+            ggml_new_tensor_2d(ctx, GGML_TYPE_F32, conv_dim, n_tokens),
+            ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, conv_dim),
+            seq_off, true);
+
+    ggml_tensor * gdn = ggml_gated_delta_net_ragged(ctx,
+            ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_k_dim, num_k_heads, n_tokens, 1),
+            ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_k_dim, num_k_heads, n_tokens, 1),
+            ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_v_dim, num_v_heads, n_tokens, 1),
+            ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, num_v_heads, n_tokens, 1),
+            ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, num_v_heads, n_tokens, 1),
+            ggml_new_tensor_4d(ctx, GGML_TYPE_F32, head_v_dim, head_v_dim, num_v_heads, n_seqs),
+            seq_off);
+
+    bool res = true;
+
+    for (uint32_t il = 0; il < hparams.n_layer() && res; ++il) {
+        if (!hparams.is_recr(il)) {
+            continue;
+        }
+
+        ggml_backend_dev_t dev = model.dev_layer(il);
+
+        res = dev != nullptr && ggml_backend_dev_supports_op(dev, conv) && ggml_backend_dev_supports_op(dev, gdn);
+    }
+
+    ggml_free(ctx);
+
+    return res;
+}
+
 llama_memory_i * llama_model::create_memory(const llama_memory_params & params, const llama_cparams & cparams) const {
     llama_memory_i * res;
 
@@ -3255,7 +3321,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* filter_recr       */ std::move(filter_recr),
                             /* filter_idx        */ std::move(filter_idx));
                     } else {
-                        res = new llama_memory_hybrid(
+                        auto * mem_hybrid = new llama_memory_hybrid(
                             /* model             */ *this,
                             /* no_alloc          */ params.no_alloc,
                             /* attn_type_k       */ params.type_k,
@@ -3273,6 +3339,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr));
+                        mem_hybrid->set_ragged(llama_model_supports_ragged(*this));
+                        res = mem_hybrid;
                     }
                 } else {
                     llama_kv_cache::layer_filter_cb filter = nullptr;

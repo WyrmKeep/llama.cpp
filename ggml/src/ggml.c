@@ -1117,9 +1117,12 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "SSM_CONV_RAGGED",
+    "GATED_DELTA_NET_RAGGED",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1234,9 +1237,12 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "ssm_conv_ragged(x)",
+    "gated_delta_net_ragged(q, k, v, g, beta, s)",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5746,6 +5752,53 @@ struct ggml_tensor * ggml_ssm_conv(
     return result;
 }
 
+// ggml_ssm_conv_ragged
+
+struct ggml_tensor * ggml_ssm_conv_ragged(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * states,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * c,
+        struct ggml_tensor  * seq_off,
+        bool                  silu) {
+    GGML_ASSERT(states->type  == GGML_TYPE_F32);
+    GGML_ASSERT(x->type       == GGML_TYPE_F32);
+    GGML_ASSERT(c->type       == GGML_TYPE_F32);
+    GGML_ASSERT(seq_off->type == GGML_TYPE_I32);
+
+    GGML_ASSERT(ggml_is_3d(states));
+    GGML_ASSERT(ggml_is_matrix(x));
+    GGML_ASSERT(ggml_is_matrix(c));
+    GGML_ASSERT(ggml_n_dims(seq_off) == 1);
+
+    const int64_t d_conv   = c->ne[0];
+    const int64_t d_inner  = c->ne[1];
+    const int64_t n_tokens = x->ne[1];
+    const int64_t n_seqs   = states->ne[2];
+
+    GGML_ASSERT(d_conv >= 2);
+    GGML_ASSERT(states->ne[0] == d_conv - 1);
+    GGML_ASSERT(states->ne[1] == d_inner);
+    GGML_ASSERT(x->ne[0]      == d_inner);
+    GGML_ASSERT(seq_off->ne[0] == n_seqs + 1);
+    GGML_ASSERT(ggml_is_contiguous(states));
+    GGML_ASSERT(ggml_is_contiguous(x));
+    GGML_ASSERT(ggml_is_contiguous(c));
+    GGML_ASSERT(ggml_is_contiguous(seq_off));
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_inner, n_tokens + (d_conv - 1) * n_seqs);
+
+    ggml_set_op_params_i32(result, 0, silu ? 1 : 0);
+
+    result->op     = GGML_OP_SSM_CONV_RAGGED;
+    result->src[0] = states;
+    result->src[1] = x;
+    result->src[2] = c;
+    result->src[3] = seq_off;
+
+    return result;
+}
+
 // ggml_ssm_scan
 
 struct ggml_tensor * ggml_ssm_scan(
@@ -6478,6 +6531,69 @@ struct ggml_tensor * ggml_gated_delta_net(
     result->src[3] = g;
     result->src[4] = beta;
     result->src[5] = state;
+
+    return result;
+}
+
+// ggml_gated_delta_net_ragged
+
+struct ggml_tensor * ggml_gated_delta_net_ragged(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * seq_off) {
+    GGML_ASSERT(ggml_is_contiguous_rows(q));
+    GGML_ASSERT(ggml_is_contiguous_rows(k));
+    GGML_ASSERT(ggml_is_contiguous_rows(v));
+    GGML_ASSERT(ggml_is_contiguous(g));
+    GGML_ASSERT(ggml_is_contiguous(beta));
+    GGML_ASSERT(ggml_is_contiguous(state));
+    GGML_ASSERT(ggml_is_contiguous(seq_off));
+
+    GGML_ASSERT(q->type       == GGML_TYPE_F32);
+    GGML_ASSERT(k->type       == GGML_TYPE_F32);
+    GGML_ASSERT(v->type       == GGML_TYPE_F32);
+    GGML_ASSERT(g->type       == GGML_TYPE_F32);
+    GGML_ASSERT(beta->type    == GGML_TYPE_F32);
+    GGML_ASSERT(state->type   == GGML_TYPE_F32);
+    GGML_ASSERT(seq_off->type == GGML_TYPE_I32);
+
+    const int64_t S_v      = v->ne[0];
+    const int64_t H        = v->ne[1];
+    const int64_t n_tokens = v->ne[2];
+    const int64_t n_seqs   = state->ne[3];
+
+    // one row of tokens for all sequences: the offsets give the tokens of each sequence
+    GGML_ASSERT(q->ne[0] == S_v && k->ne[0] == S_v);
+    GGML_ASSERT(q->ne[1] == k->ne[1] && H % q->ne[1] == 0);
+    GGML_ASSERT(q->ne[2] == n_tokens && k->ne[2] == n_tokens);
+    GGML_ASSERT(q->ne[3] == 1 && k->ne[3] == 1 && v->ne[3] == 1);
+
+    // scalar gate only
+    GGML_ASSERT(g->ne[0] == 1 && g->ne[1] == H && g->ne[2] == n_tokens && g->ne[3] == 1);
+    GGML_ASSERT(beta->ne[0] == 1 && beta->ne[1] == H && beta->ne[2] == n_tokens && beta->ne[3] == 1);
+
+    GGML_ASSERT(state->ne[0] == S_v);
+    GGML_ASSERT(state->ne[1] == S_v);
+    GGML_ASSERT(state->ne[2] == H);
+
+    GGML_ASSERT(ggml_n_dims(seq_off) == 1 && seq_off->ne[0] == n_seqs + 1);
+
+    const int64_t ne[4] = { S_v * H, n_tokens + S_v * n_seqs, 1, 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op     = GGML_OP_GATED_DELTA_NET_RAGGED;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = g;
+    result->src[4] = beta;
+    result->src[5] = state;
+    result->src[6] = seq_off;
 
     return result;
 }

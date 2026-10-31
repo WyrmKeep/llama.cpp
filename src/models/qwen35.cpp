@@ -356,6 +356,10 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     const int64_t num_k_heads  = hparams.ssm_n_group;
     const int64_t num_v_heads  = hparams.ssm_dt_rank;
     const int64_t head_v_dim   = d_inner / num_v_heads;
+
+    if (ubatch.ragged()) {
+        return build_layer_attn_linear_ragged(inp, cur, il);
+    }
     const int64_t n_seq_tokens = ubatch.n_seq_tokens;
 
     GGML_ASSERT(n_seqs != 0);
@@ -472,6 +476,178 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
 
     // Final reshape: [head_dim, n_heads, n_tokens, n_seqs] -> [n_heads * head_dim , n_tokens * n_seqs ]
     ggml_tensor * final_output = ggml_reshape_2d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_seq_tokens * n_seqs);
+    cb(final_output, "final_output", il);
+
+    // Output projection
+    cur = build_lora_mm(model.layers[il].ssm_out, final_output, model.layers[il].ssm_out_s);
+    cb(cur, "linear_attn_out", il);
+
+    return cur;
+}
+
+// ubatch with sequence sets of different token counts: the tokens of the sets form one row of n_tokens tokens (the sets
+//   one after the other), only the recurrent ops see the sets. They get the first token of each set from seq_off.
+//   Same arithmetic as the equal-length graph above: the conv and the gated delta net run each token in the same order
+ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear_ragged(
+        llm_graph_input_rs * inp,
+        ggml_tensor *        cur,
+        int                  il) {
+    const auto * mctx_cur = inp->mctx;
+
+    const int64_t d_inner      = hparams.ssm_d_inner;
+    const int64_t n_seqs       = ubatch.n_seqs;
+    const int64_t head_k_dim   = hparams.ssm_d_state;
+    const int64_t num_k_heads  = hparams.ssm_n_group;
+    const int64_t num_v_heads  = hparams.ssm_dt_rank;
+    const int64_t head_v_dim   = d_inner / num_v_heads;
+
+    GGML_ASSERT(n_seqs != 0);
+    GGML_ASSERT(ubatch.ragged());
+    GGML_ASSERT(inp->seq_off != nullptr);
+    GGML_ASSERT(cparams.n_rs_seq == 0);
+    GGML_ASSERT(num_v_heads % num_k_heads == 0);
+
+    // Input projections
+    ggml_tensor * qkv_mixed = build_lora_mm(model.layers[il].wqkv, cur, model.layers[il].wqkv_s);
+    cb(qkv_mixed, "linear_attn_qkv_mixed", il);
+
+    ggml_tensor * z = build_lora_mm(model.layers[il].wqkv_gate, cur, model.layers[il].wqkv_gate_s);
+    cb(z, "z", il);
+
+    ggml_tensor * beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
+    beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_tokens, 1);
+    cb(beta, "beta", il);
+
+    beta = ggml_sigmoid(ctx0, beta);
+    cb(beta, "beta_sigmoid", il);
+
+    ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
+    alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_tokens, 1);
+    cb(alpha, "alpha", il);
+
+    ggml_tensor * alpha_biased   = ggml_add(ctx0, alpha, model.layers[il].ssm_dt);
+    ggml_tensor * alpha_softplus = ggml_softplus(ctx0, alpha_biased);
+    cb(alpha_softplus, "a_softplus", il);
+
+    ggml_tensor * gate = ggml_mul(ctx0, alpha_softplus, model.layers[il].ssm_a);  // -A_log.exp() * softplus
+    cb(gate, "gate", il);
+
+    gate = ggml_reshape_4d(ctx0, gate, 1, num_v_heads, n_tokens, 1);
+
+    ggml_tensor * conv_states_all = mctx_cur->get_r_l(il);
+    ggml_tensor * ssm_states_all  = mctx_cur->get_s_l(il);
+
+    ggml_tensor * conv_kernel      = model.layers[il].ssm_conv1d;
+    const int64_t conv_kernel_size = conv_kernel->ne[0];
+    const int64_t conv_channels    = d_inner + 2 * hparams.ssm_n_group * hparams.ssm_d_state;
+
+    const auto kv_head = mctx_cur->get_head();
+
+    // conv states and recurrent states of the sets before the ubatch
+    ggml_tensor * conv_states = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs);
+    cb(conv_states, "conv_states", il);
+
+    conv_states = ggml_reshape_3d(ctx0, conv_states, conv_kernel_size - 1, conv_channels, n_seqs);
+    cb(conv_states, "conv_states_reshaped", il);
+
+    ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+    state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+    cb(state, "state_predelta", il);
+
+    // conv + silu for all the sets; the new conv states follow the conv output
+    ggml_tensor * conv_out = ggml_ssm_conv_ragged(ctx0, conv_states, qkv_mixed, conv_kernel, inp->seq_off, true);
+    cb(conv_out, "conv_output_ragged", il);
+
+    ggml_tensor * conv_qkv_mix = ggml_view_2d(ctx0, conv_out, conv_channels, n_tokens,
+            ggml_row_size(conv_out->type, conv_channels), 0);
+    cb(conv_qkv_mix, "conv_output_silu", il);
+
+    {
+        const int64_t row_count = (conv_kernel_size - 1) * conv_channels;
+
+        ggml_tensor * conv_state_last = ggml_view_2d(ctx0, conv_out, row_count, n_seqs,
+                ggml_row_size(conv_out->type, row_count),
+                ggml_row_size(conv_out->type, conv_channels * n_tokens));
+        cb(conv_state_last, "conv_state_last", il);
+
+        ggml_tensor * conv_state_update = ggml_view_2d(ctx0, conv_states_all,
+                row_count, n_seqs, conv_states_all->nb[1],
+                kv_head * ggml_row_size(conv_states_all->type, row_count));
+        cb(conv_state_update, "conv_state_update", il);
+
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_state_last, conv_state_update));
+    }
+
+    // Calculate the total conv dimension
+    int64_t qkv_dim = head_k_dim * num_k_heads * 2 + head_v_dim * num_v_heads;
+    int64_t nb1_qkv = ggml_row_size(conv_qkv_mix->type, qkv_dim);
+
+    // Extract the convolved Q, K, V from conv_output
+    ggml_tensor * q_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, num_k_heads, n_tokens, 1,
+            ggml_row_size(conv_qkv_mix->type, head_k_dim),
+            nb1_qkv,
+            nb1_qkv * n_tokens,
+            0);
+
+    ggml_tensor * k_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_k_dim, num_k_heads, n_tokens, 1,
+            ggml_row_size(conv_qkv_mix->type, head_k_dim),
+            nb1_qkv,
+            nb1_qkv * n_tokens,
+            head_k_dim * num_k_heads * ggml_element_size(conv_qkv_mix));
+
+    ggml_tensor * v_conv = ggml_view_4d(ctx0, conv_qkv_mix, head_v_dim, num_v_heads, n_tokens, 1,
+            ggml_row_size(conv_qkv_mix->type, head_v_dim),
+            nb1_qkv,
+            nb1_qkv * n_tokens,
+            ggml_row_size(conv_qkv_mix->type, 2 * head_k_dim * num_k_heads));
+
+    cb(q_conv, "q_conv", il);
+    cb(k_conv, "k_conv", il);
+    cb(v_conv, "v_conv", il);
+
+    const float eps_norm = hparams.f_norm_rms_eps;
+
+    q_conv = build_gdn_l2_norm(ctx0, q_conv, eps_norm);
+    k_conv = build_gdn_l2_norm(ctx0, k_conv, eps_norm);
+
+    cb(q_conv, "q_conv_predelta", il);
+    cb(k_conv, "k_conv_predelta", il);
+    cb(v_conv, "v_conv_predelta", il);
+
+    // gated delta net for all the sets (q and k heads are repeated to the v heads inside the op)
+    ggml_tensor * gdn = ggml_gated_delta_net_ragged(ctx0, q_conv, k_conv, v_conv, gate, beta, state, inp->seq_off);
+    cb(gdn, "gdn_ragged", il);
+
+    ggml_tensor * output = ggml_view_4d(ctx0, gdn,
+            head_v_dim, num_v_heads, n_tokens, 1,
+            ggml_row_size(gdn->type, head_v_dim),
+            ggml_row_size(gdn->type, head_v_dim * num_v_heads),
+            ggml_row_size(gdn->type, head_v_dim * num_v_heads * n_tokens), 0);
+    cb(output, "attn_output", il);
+
+    // write the final recurrent state of each set into the cache
+    {
+        const int64_t n_embd_s = hparams.n_embd_s();
+
+        ggml_tensor * new_state = ggml_view_2d(ctx0, gdn, n_embd_s, n_seqs,
+                ggml_row_size(gdn->type, n_embd_s),
+                ggml_row_size(gdn->type, head_v_dim * num_v_heads * n_tokens));
+        cb(new_state, "new_state", il);
+
+        ggml_build_forward_expand(gf,
+                ggml_cpy(ctx0, new_state,
+                    ggml_view_2d(ctx0, ssm_states_all, n_embd_s, n_seqs, ssm_states_all->nb[1],
+                        kv_head * n_embd_s * ggml_element_size(ssm_states_all))));
+    }
+
+    // z: [head_dim, n_heads, n_tokens]
+    ggml_tensor * z_2d = ggml_reshape_4d(ctx0, z, head_v_dim, num_v_heads, n_tokens, 1);
+
+    // Apply gated normalization: self.norm(core_attn_out, z)
+    ggml_tensor * attn_out_norm = build_norm_gated(output, model.layers[il].ssm_norm, z_2d, il);
+
+    // Final reshape: [head_dim, n_heads, n_tokens] -> [n_heads * head_dim, n_tokens]
+    ggml_tensor * final_output = ggml_reshape_2d(ctx0, attn_out_norm, head_v_dim * num_v_heads, n_tokens);
     cb(final_output, "final_output", il);
 
     // Output projection

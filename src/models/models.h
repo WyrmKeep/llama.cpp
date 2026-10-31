@@ -2664,6 +2664,12 @@ struct llama_model_qwen35 : public llama_model_base {
                     ggml_tensor * cur,
                             int   il);
 
+        // the same for a ragged ubatch: the sequence sets have different token counts
+        ggml_tensor * build_layer_attn_linear_ragged(
+             llm_graph_input_rs * inp,
+                    ggml_tensor * cur,
+                            int   il);
+
         ggml_tensor * build_layer_ffn(
                     ggml_tensor * cur,
                             int   il);

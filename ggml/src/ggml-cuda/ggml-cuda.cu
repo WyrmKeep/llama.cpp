@@ -61,6 +61,7 @@
 #include "ggml-cuda/wkv.cuh"
 #include "ggml-cuda/gla.cuh"
 #include "ggml-cuda/gated_delta_net.cuh"
+#include "ggml-cuda/ragged-seq.cuh"
 #include "ggml-cuda/dsv4-hc.cuh"
 #include "ggml-cuda/set.cuh"
 #include "ggml-cuda/set-rows.cuh"
@@ -2697,6 +2698,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_SSM_CONV:
             ggml_cuda_op_ssm_conv(ctx, dst);
             break;
+        case GGML_OP_SSM_CONV_RAGGED:
+            ggml_cuda_op_ssm_conv_ragged(ctx, dst);
+            break;
         case GGML_OP_SSM_SCAN:
             ggml_cuda_op_ssm_scan(ctx, dst);
             break;
@@ -2723,6 +2727,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_GATED_DELTA_NET:
             ggml_cuda_op_gated_delta_net(ctx, dst);
+            break;
+        case GGML_OP_GATED_DELTA_NET_RAGGED:
+            ggml_cuda_op_gated_delta_net_ragged(ctx, dst, nullptr);
             break;
         case GGML_OP_DSV4_HC_COMB:
             ggml_cuda_op_dsv4_hc_comb(ctx, dst);
@@ -3190,6 +3197,65 @@ static int ggml_cuda_try_gdn_cache_fusion(
 
     fused_state_cpy.data        = (float *) dst->data; // rollback group 0 (newest)
     fused_state_cpy.slot_stride = K > 1 ? (int64_t) (dst->nb[2] / sizeof(float)) : 0;
+    return skip;
+}
+
+// match gated_delta_net_ragged + the cpy that writes the final state of each sequence into the cache,
+// so the kernel can write them there and skip the cpy (see ggml_cuda_try_gdn_cache_fusion)
+static int ggml_cuda_try_gdn_ragged_cache_fusion(
+        const ggml_cgraph * cgraph, int node_idx, float *& state_cache) {
+    const ggml_tensor * gdn = cgraph->nodes[node_idx];
+    // the kernel skips the state tail, so the gdn output must not be a graph output
+    if (gdn->op != GGML_OP_GATED_DELTA_NET_RAGGED || gdn->type != GGML_TYPE_F32 ||
+        (gdn->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return 0;
+    }
+
+    const ggml_tensor * src_v    = gdn->src[2];
+    const int64_t       S_v      = src_v->ne[0];
+    const int64_t       H        = src_v->ne[1];
+    const int64_t       n_tokens = src_v->ne[2];
+    const int64_t       n_seqs   = gdn->src[5]->ne[3];
+    const int64_t       D        = S_v * S_v * H;
+
+    // the states start right after the attention scores
+    const size_t tail_off = ggml_row_size(GGML_TYPE_F32, S_v * H * n_tokens);
+
+    // the cpy is the first real node after the gdn (skip views/no-ops)
+    const ggml_tensor * cpy  = nullptr;
+    int                 skip = 0;
+    for (int j = node_idx + 1; j < cgraph->n_nodes && cpy == nullptr; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(n)) {
+            continue;
+        }
+        if (n->op != GGML_OP_CPY || (n->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            return 0;
+        }
+        cpy  = n;
+        skip = j - node_idx;
+    }
+    if (cpy == nullptr) {
+        return 0;
+    }
+
+    const ggml_tensor * src = cpy->src[0]; // view of the states in the gdn output
+    const ggml_tensor * dst = cpy->src[1]; // cache view the kernel writes to
+
+    if (src->op != GGML_OP_VIEW || src->view_src != gdn || src->view_offs != tail_off ||
+        !ggml_is_contiguous(src)) {
+        return 0;
+    }
+
+    // dst is the [D, n_seqs] cache view; the kernel assumes nb[1] == D
+    const std::array<int64_t, GGML_MAX_DIMS> expected_ne = { D, n_seqs, 1, 1 };
+    if (dst->op != GGML_OP_VIEW || dst->type != GGML_TYPE_F32 || dst->data == nullptr ||
+        !std::equal(expected_ne.begin(), expected_ne.end(), dst->ne) ||
+        dst->nb[0] != ggml_type_size(GGML_TYPE_F32) || dst->nb[1] != (size_t) ggml_row_size(GGML_TYPE_F32, D)) {
+        return 0;
+    }
+
+    state_cache = (float *) dst->data;
     return skip;
 }
 
@@ -4173,6 +4239,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                           __func__, node->name, nodes_to_skip);
 #endif
             ggml_cuda_op_gated_delta_net_fused_cache(*cuda_ctx, node, fused_state_cpy);
+            return nodes_to_skip;
+        }
+    }
+
+    // gated_delta_net_ragged -> cpy: write the final states into the cache
+    if (node->op == GGML_OP_GATED_DELTA_NET_RAGGED) {
+        float * state_cache = nullptr;
+        const int nodes_to_skip = ggml_cuda_try_gdn_ragged_cache_fusion(cgraph, i, state_cache);
+        if (nodes_to_skip > 0) {
+            ggml_cuda_op_gated_delta_net_ragged(*cuda_ctx, node, state_cache);
             return nodes_to_skip;
         }
     }
@@ -6311,6 +6387,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             // assumes d_inner % threads == 0
             return op->src[0]->ne[1] % 128 == 0;
         }
+        case GGML_OP_SSM_CONV_RAGGED:
+            return ggml_cuda_ssm_conv_ragged_supported(op);
         case GGML_OP_CONT:
             return true;
         case GGML_OP_DIAG_MASK_INF:
@@ -6386,6 +6464,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return true;
         case GGML_OP_GATED_DELTA_NET:
             return true;
+        case GGML_OP_GATED_DELTA_NET_RAGGED:
+            return ggml_cuda_gated_delta_net_ragged_supported(op);
         case GGML_OP_DSV4_HC_COMB:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;

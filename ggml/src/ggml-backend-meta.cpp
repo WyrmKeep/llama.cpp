@@ -1027,6 +1027,10 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_SSM_CONV: {
                 split_state = handle_ssm_conv(src_ss);
             } break;
+            case GGML_OP_SSM_CONV_RAGGED:
+            case GGML_OP_GATED_DELTA_NET_RAGGED: {
+                split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+            } break;
             case GGML_OP_SSM_SCAN:
             case GGML_OP_WIN_PART:
             case GGML_OP_WIN_UNPART:
