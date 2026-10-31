@@ -240,6 +240,33 @@ static diff_stats diff_states(const std::vector<std::vector<std::vector<float>>>
     return st;
 }
 
+// the largest NMSE of one layer over all sequences, for a table of the layers
+static double layer_nmse(const std::vector<std::vector<std::vector<float>>> & a, const std::vector<std::vector<std::vector<float>>> & ref, size_t il) {
+    diff_stats st;
+    for (size_t s = 0; s < a.size(); ++s) {
+        if (il < a[s].size()) {
+            diff_vec(st, a[s][il], ref[s][il]);
+        }
+    }
+
+    return st.nmse;
+}
+
+// one line for each recurrent layer: the NMSE of the conv and the recurrent state of three comparisons
+static void print_layers(const run_result & ragged, const run_result & equal, const run_result & solo) {
+    printf("layer  ragged-vs-equal conv / ssm   equal-vs-one-at-a-time conv / ssm   ragged-vs-one-at-a-time conv / ssm  (NMSE)\n");
+    for (size_t il = 0; il < ragged.conv[0].size(); ++il) {
+        if (ragged.conv[0][il].empty() && ragged.ssm[0][il].empty()) {
+            continue;
+        }
+
+        printf("%5zu  %.3e %.3e        %.3e %.3e              %.3e %.3e\n", il,
+                layer_nmse(ragged.conv, equal.conv, il), layer_nmse(ragged.ssm, equal.ssm, il),
+                layer_nmse(equal.conv,  solo.conv,  il), layer_nmse(equal.ssm,  solo.ssm,  il),
+                layer_nmse(ragged.conv, solo.conv,  il), layer_nmse(ragged.ssm, solo.ssm,  il));
+    }
+}
+
 struct logit_stats {
     double kl_mean   = 0.0; // KL(ref || a), mean over the rows
     double kl_max    = 0.0;
@@ -456,6 +483,8 @@ int main(int argc, char ** argv) {
     GGML_UNUSED(rep);
     GGML_UNUSED(solo_d);
     GGML_UNUSED(solo_r);
+
+    print_layers(ragged, old_split, solo);
 
     bool ok = true;
 
