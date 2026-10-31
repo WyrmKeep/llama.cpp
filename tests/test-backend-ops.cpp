@@ -6085,6 +6085,74 @@ struct test_mul_mat_id_dup : public test_mul_mat_id {
     }
 };
 
+// the products of some rows of a with the columns of b (the output head of a model for a few tokens)
+struct test_mul_mat_rows : public test_case {
+    const ggml_type type_a;
+    const int64_t n_rows;
+    const int64_t k;
+    const int64_t n_cols;
+    const int64_t n_ids;
+    const bool same_rows; // the same rows for all the columns
+
+    std::string vars() override {
+        return VARS_TO_STR6(type_a, n_rows, k, n_cols, n_ids, same_rows);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * k * n_cols * n_ids;
+    }
+
+    test_mul_mat_rows(ggml_type type_a = GGML_TYPE_Q8_0, int64_t n_rows = 4096, int64_t k = 256,
+            int64_t n_cols = 1, int64_t n_ids = 8, bool same_rows = true)
+        : type_a(type_a), n_rows(n_rows), k(k), n_cols(n_cols), n_ids(n_ids), same_rows(same_rows) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_2d(ctx, type_a, k, n_rows);
+        ggml_set_name(a, "a");
+
+        ggml_tensor * b = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n_cols);
+        ggml_set_name(b, "b");
+
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_cols, n_ids);
+        ggml_set_name(ids, "ids");
+
+        ggml_tensor * out = ggml_mul_mat_rows(ctx, a, b, ids);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::default_random_engine rng(1234);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE || t->view_src != nullptr) {
+                continue; // only the inputs
+            }
+            if (t->type != GGML_TYPE_I32) {
+                init_tensor_uniform(t);
+                continue;
+            }
+            // [n_cols, n_ids], the rows of a: the same row can be in several columns
+            std::vector<int32_t> data(n_cols * n_ids);
+            for (int64_t i = 0; i < n_ids; i++) {
+                const int32_t row = (int32_t) (rng() % n_rows);
+                for (int64_t j = 0; j < n_cols; j++) {
+                    data[i * n_cols + j] = same_rows ? row : (int32_t) (rng() % n_rows);
+                }
+            }
+            // the first and the last rows of a are always used
+            data[0] = 0;
+            data[n_cols * n_ids - 1] = (int32_t) (n_rows - 1);
+            ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+        }
+    }
+};
+
 // FP4 W4A8 path on the MoE path (GGML_PREC_Q8 on src1 disallows 4-bit activations)
 struct test_mul_mat_id_w4a8 : public test_mul_mat_id {
     test_mul_mat_id_w4a8(ggml_type type_a = GGML_TYPE_NVFP4, ggml_type type_b = GGML_TYPE_F32,
@@ -12080,6 +12148,29 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id_dup(ta, GGML_TYPE_F32, 2050, 10, true, 64, 33, 256));
     }
 #endif
+
+    // the products of some rows of a matrix with a few columns, as the output head of a model does for a few tokens
+    // the same row is in several columns of ids: the backend must accept this (see ggml_mul_mat_rows)
+    for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
+        for (int64_t n_cols : {1, 2, 3, 4}) {
+            for (int64_t n_ids : {1, 10, 33}) {
+                for (bool same_rows : {true, false}) {
+                    test_cases.emplace_back(new test_mul_mat_rows(type_a, 4096, 2560, n_cols, n_ids, same_rows));
+                }
+            }
+        }
+    }
+    test_cases.emplace_back(new test_mul_mat_rows(GGML_TYPE_Q8_0, 2048, 256, 1, 3, true));
+    // small k: the kernel uses more rows for each block, so the rows of the matrix must not run over their end
+    for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K}) {
+        for (int64_t n_cols : {1, 3}) {
+            test_cases.emplace_back(new test_mul_mat_rows(type_a, 4001, 1536, n_cols, 10, false));
+        }
+    }
+    // the same for MUL_MAT_ID with a row count that is not a multiple of 4
+    for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
+        test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 8, 2, false, 6, 1, 512));
+    }
 
     for (ggml_type type_a : all_types) {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 2, false, 64, 16, 3*ggml_blck_size(type_a)));

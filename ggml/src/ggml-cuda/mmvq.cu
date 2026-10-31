@@ -1145,6 +1145,12 @@ static void mul_mat_vec_q_switch_ncols_dst(
         const int  nwarps = calc_nwarps(type, c_ncols_dst, table_id);
         bool       use    = nwarps > 1 && blocks_per_row_x < nwarps * blocks_per_iter_1warp;
 
+        // With ids, the end-of-rows guard in the kernel compares with the stride of the destination columns, not with the
+        // number of rows. Each block must therefore have all its rows. A matrix with one row for each expert has not.
+        if (has_ids && nrows_x % nwarps != 0) {
+            use = false;
+        }
+
         constexpr std::array<ggml_type, 2> iq_slow_turing = {
             GGML_TYPE_IQ3_XXS,
             GGML_TYPE_IQ3_S,

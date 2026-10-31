@@ -84,6 +84,14 @@ struct llama_context {
     float * get_logits();
     float * get_logits_ith(int32_t i);
 
+    // compute the logits of the listed tokens only, the next batches have a row of n_tokens values for every output
+    // an empty list restores the logits of the whole vocabulary
+    void set_logit_tokens(const llama_token * tokens, size_t n_tokens);
+
+    // the tokens of the values of the rows of the last batch, nullptr if the rows have the whole vocabulary
+    const llama_token * get_logit_tokens(size_t * n_tokens) const;
+    float * get_logit_tokens_ith(int32_t i);
+
     float * get_embeddings();
     float * get_embeddings_ith(int32_t i);
     float * get_embeddings_seq(llama_seq_id seq_id);
@@ -309,8 +317,21 @@ private:
     llama_memory_ptr memory;
     llama_moe_cache_ptr moe_cache;
 
-    // decode output (2-dimensional array: [n_outputs][n_vocab])
+    // decode output (2-dimensional array: [n_outputs][n_vocab], or [n_outputs][logit_tokens_out.size()] with logit_tokens_out)
     buffer_view<float> logits = {nullptr, 0};
+
+    // the tokens whose logits the next batches compute, empty for all the tokens of the vocabulary
+    std::vector<llama_token> logit_tokens;
+
+    // the tokens of the columns of the logits of the last batch, empty if the rows of logits have all the tokens of the vocabulary
+    // this is a copy: the list of the graph must not change while the graph can be reused
+    std::vector<llama_token> logit_tokens_out;
+
+    // the reserved graphs have the head of a list of tokens from the first list to the end of the context: the graphs of
+    // the batches have the same nodes, and tensors that are not larger than the reserved tensors
+    // the list has LLM_GRAPH_LOGIT_TOKENS_MAX tokens
+    bool logit_tokens_reserve = false;
+    std::vector<llama_token> logit_tokens_reserve_list;
 
     // embeddings output (2-dimensional array: [n_outputs][n_embd])
     // populated only when pooling_type == LLAMA_POOLING_TYPE_NONE

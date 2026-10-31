@@ -17,6 +17,7 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
+#include <atomic>
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -319,6 +320,39 @@ bool llm_graph_input_out_ids::can_reuse(const llm_graph_params & params) {
     res &= n_outputs == params.n_outputs;
 
     return res;
+}
+
+void llm_graph_input_logit_tokens::set_input(const llama_ubatch * ubatch) {
+    GGML_UNUSED(ubatch);
+    GGML_ASSERT(ids);
+
+    // a batch without outputs has no columns
+    if (ggml_nelements(ids) == 0) {
+        return;
+    }
+
+    const int64_t n_tokens = tokens.size();
+
+    std::vector<int32_t> data(ggml_nelements(ids));
+
+    for (int64_t j = 0; j < n_cols; ++j) {
+        for (int64_t i = 0; i < n_tokens; ++i) {
+            if (gather) {
+                // [n_tokens, 1, n_cols]
+                data[j*n_tokens + i] = tokens[i];
+            } else {
+                // [n_cols, n_tokens]
+                data[i*n_cols + j] = tokens[i];
+            }
+        }
+    }
+
+    ggml_backend_tensor_set(ids, data.data(), 0, ggml_nbytes(ids));
+}
+
+bool llm_graph_input_logit_tokens::can_reuse(const llm_graph_params & params) {
+    // the number of columns follows the number of outputs, this is compared with the graph parameters
+    return params.logit_tokens != nullptr && *params.logit_tokens == tokens;
 }
 
 void llm_graph_input_mean::set_input(const llama_ubatch * ubatch) {
@@ -1694,6 +1728,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     prec_policy      (params.prec_policy),
     hdmd             (params.hdmd),
     samplers         (params.samplers),
+    logit_tokens     (params.logit_tokens),
     cb_func          (params.cb),
     res              (params.res),
     ctx0             (res->get_ctx()),
@@ -4354,10 +4389,139 @@ void llm_graph_context::build_pooling(
     ggml_build_forward_expand(gf, cur);
 }
 
+// up to this number of output rows, the CUDA matrix-vector kernel has the same sum order for a row of a weight
+// in a product with one column as in a product with all the columns (see ggml_mul_mat_rows)
+static constexpr int64_t LLM_GRAPH_HEAD_ROWS_MAX_COLS = 4;
+
+// the number of products of the reduced head: one for every output row and listed token
+static constexpr int64_t LLM_GRAPH_HEAD_ROWS_MAX_IDS = 4096;
+
+// true if the weight is in a buffer of a CUDA device, the head of the other devices is not verified
+static bool llm_graph_head_on_cuda(const ggml_tensor * w) {
+    if (w->buffer == nullptr) {
+        return false;
+    }
+
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(w->buffer);
+    ggml_backend_dev_t         dev  = ggml_backend_buft_get_device(buft);
+    ggml_backend_reg_t         reg  = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+
+    // the tensor-split buffer of CUDA has its own product
+    return reg != nullptr && strcmp(ggml_backend_reg_name(reg), "CUDA") == 0 && strstr(ggml_backend_buft_name(buft), "Split") == nullptr;
+}
+
+// true if the head is the plain product of a weight and the activation, and the products of its rows
+// are done with the same sum order as in the full head
+static bool llm_graph_head_rows(const ggml_tensor * logits, int64_t n_cols, int64_t n_tokens) {
+    // one block of the CUDA kernel for every product: the grid has at most 65535 of them
+    if (logits->op != GGML_OP_MUL_MAT || n_cols > LLM_GRAPH_HEAD_ROWS_MAX_COLS || n_cols*n_tokens > LLM_GRAPH_HEAD_ROWS_MAX_IDS) {
+        return false;
+    }
+
+    // a precision, a hint or any other setting of the product
+    for (size_t i = 0; i < GGML_MAX_OP_PARAMS/sizeof(int32_t); ++i) {
+        if (logits->op_params[i] != 0) {
+            return false;
+        }
+    }
+
+    const ggml_tensor * w = logits->src[0];
+    const ggml_tensor * x = logits->src[1];
+
+    if (x->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || x->ne[2] != 1 || x->ne[3] != 1) {
+        return false;
+    }
+
+    if (w->ne[2] != 1 || w->ne[3] != 1 || w->nb[0] != ggml_type_size(w->type)) {
+        return false;
+    }
+
+    switch (w->type) {
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q4_1:
+        case GGML_TYPE_Q5_0:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+            break;
+        default:
+            return false;
+    }
+
+    return llm_graph_head_on_cuda(w);
+}
+
+ggml_tensor * llm_graph_context::build_logits_tokens(ggml_tensor * logits) const {
+    GGML_ASSERT(logit_tokens != nullptr && !logit_tokens->empty());
+
+    const int64_t n_lt   = logit_tokens->size();
+    const int64_t n_rows = logits->ne[1]; // outputs
+
+    ggml_tensor * cur = nullptr;
+
+    // the path does not depend on the number of outputs and on the length of the list of this graph: every graph of
+    // the context then has the nodes of the reserved graphs, and the tensors of the reserved graphs are not smaller
+    // (a graph with more outputs than n_outputs_max is a probe of the memory, it does not run)
+    if (n_rows <= (int64_t) cparams.n_outputs_max && llm_graph_head_rows(logits, cparams.n_outputs_max, LLM_GRAPH_LOGIT_TOKENS_MAX)) {
+        // the head reads only the rows of the listed tokens
+        // the product needs one column at least: an empty activation is padded, so that the topology
+        // of the graph is the same for every number of outputs
+        const int64_t n_cols = std::max<int64_t>(n_rows, 1);
+
+        auto inp = std::make_unique<llm_graph_input_logit_tokens>(*logit_tokens, n_cols, false);
+
+        inp->ids = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_cols, n_lt);
+        ggml_set_input(inp->ids);
+        ggml_set_name(inp->ids, "logit_tokens");
+
+        ggml_tensor * x = ggml_pad(ctx0, logits->src[1], 0, n_cols - n_rows, 0, 0);
+
+        cur = ggml_mul_mat_rows(ctx0, logits->src[0], x, inp->ids);
+
+        // one line in the log of the process, to show which head the graphs have
+        static std::atomic<bool> logged_rows(false);
+        if (!logged_rows.exchange(true)) {
+            LLAMA_LOG_INFO("%s: the head reads the rows of %d tokens for %d output rows (more graphs of this kind follow)\n", __func__, (int) n_lt, (int) n_rows);
+        }
+
+        res->add_input(std::move(inp));
+    } else {
+        // the full head, then the values of the listed tokens are taken from the rows of the logits
+        auto inp = std::make_unique<llm_graph_input_logit_tokens>(*logit_tokens, n_rows, true);
+
+        inp->ids = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, n_lt, 1, n_rows);
+        ggml_set_input(inp->ids);
+        ggml_set_name(inp->ids, "logit_tokens");
+
+        if (!ggml_is_contiguous(logits)) {
+            logits = ggml_cont(ctx0, logits);
+        }
+
+        // every value of the logits is a row of its own, every output is a slice
+        cur = ggml_get_rows(ctx0, ggml_reshape_4d(ctx0, logits, 1, logits->ne[0], 1, n_rows), inp->ids);
+        cur = ggml_reshape_2d(ctx0, cur, n_lt, n_rows);
+
+        static std::atomic<bool> logged_full(false);
+        if (!logged_full.exchange(true)) {
+            LLAMA_LOG_INFO("%s: the full head, then the values of %d tokens for %d output rows (more graphs of this kind follow)\n", __func__, (int) n_lt, (int) n_rows);
+        }
+
+        res->add_input(std::move(inp));
+    }
+
+    cb(cur, "result_output_tokens", -1);
+
+    return cur;
+}
+
 void llm_graph_context::build_logits() const {
     // a pooled embeddings context outputs one vector per sequence, so its graph skips the LM head
     if (cparams.embeddings && pooling_type != LLAMA_POOLING_TYPE_NONE) {
         res->t_logits = nullptr;
+    }
+
+    // only the listed tokens: the backend samplers read the logits of the whole vocabulary
+    if (res->t_logits != nullptr && logit_tokens != nullptr && samplers.empty()) {
+        res->t_logits = build_logits_tokens(res->t_logits);
     }
 
     // the models declare t_logits without expanding it, so the LM head is computed only when it is expanded here
