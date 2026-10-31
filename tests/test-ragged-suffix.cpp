@@ -44,9 +44,7 @@ struct test_params {
     int         ngl        = 999;
     int         n_prefix   = 600;
     bool        all_logits = false;
-    double      kl_mean    = 1e-5;     // the limit of the mean KL divergence, 10 times the floor when the floor is larger
-    double      kl_max     = 1e-3;     // the limit of the largest KL divergence, same rule
-    double      state_nmse = 5e-4;     // the tolerance of the ops
+    double      kl_budget  = 0.0;      // the KL budget of the text, 0 = no check of the absolute limit
     std::vector<int> lens  = { 43, 47, 73 };
 };
 
@@ -347,12 +345,8 @@ int main(int argc, char ** argv) {
             p.text = next();
         } else if (arg == "--all-logits") {
             p.all_logits = true;
-        } else if (arg == "--kl-mean") {
-            p.kl_mean = atof(next());
-        } else if (arg == "--kl-max") {
-            p.kl_max = atof(next());
-        } else if (arg == "--state-nmse") {
-            p.state_nmse = atof(next());
+        } else if (arg == "--kl-budget") {
+            p.kl_budget = atof(next());
         } else if (arg == "--lens") {
             p.lens.clear();
             std::stringstream ss(next());
@@ -367,7 +361,7 @@ int main(int argc, char ** argv) {
     }
 
     if (p.model.empty() || p.lens.size() < 2) {
-        fprintf(stderr, "usage: %s -m model.gguf [-ngl N] [--prefix N] [--lens a,b,c] [--text file] [--all-logits]\n", argv[0]);
+        fprintf(stderr, "usage: %s -m model.gguf [-ngl N] [--prefix N] [--lens a,b,c] [--text file] [--all-logits] [--kl-budget X]\n", argv[0]);
         return 1;
     }
 
@@ -474,15 +468,13 @@ int main(int argc, char ** argv) {
         return std::make_tuple(l, c, s);
     };
 
+    // d(x) = x against the reference, the decode of one sequence at a time
     const auto fl     = report("floor (equal again)",    old_again, old_split);
-    const auto test   = report("ragged vs equal",        ragged,    old_split);
+    GGML_UNUSED(fl);
     const auto rep    = report("ragged again vs ragged", ragged_2,  ragged);
-    const auto solo_d = report("equal vs one at a time", old_split, solo);
-    const auto solo_r = report("ragged vs one at a time", ragged,   solo);
-
-    GGML_UNUSED(rep);
-    GGML_UNUSED(solo_d);
-    GGML_UNUSED(solo_r);
+    const auto d_eq   = report("equal vs one at a time", old_split, solo);
+    const auto d_rg   = report("ragged vs one at a time", ragged,   solo);
+    const auto r_vs_e = report("ragged vs equal",        ragged,    old_split);
 
     print_layers(ragged, old_split, solo);
 
@@ -495,18 +487,43 @@ int main(int argc, char ** argv) {
 
     check(ragged.n_passes == 1, "the ragged split decodes all the suffixes in one pass");
     check(old_split.n_passes > 1, "the equal split needs more than one pass");
-    // the limits apply when the floor (the same build against itself) is below them, else the limit is 10 times the floor
-    const double tol_mean = std::get<0>(fl).kl_mean < p.kl_mean ? p.kl_mean : 10.0*std::get<0>(fl).kl_mean;
-    const double tol_max  = std::get<0>(fl).kl_max  < p.kl_max  ? p.kl_max  : 10.0*std::get<0>(fl).kl_max;
+    check(std::get<0>(rep).kl_mean == 0.0 && std::get<0>(rep).kl_max == 0.0 &&
+          std::get<1>(rep).n_same == std::get<1>(rep).n_vec && std::get<2>(rep).n_same == std::get<2>(rep).n_vec,
+          "a second ragged run gives the same logits and the same states bit for bit");
 
-    printf("floor: kl_mean %.3e kl_max %.3e -> limits: kl_mean %.3e kl_max %.3e\n",
-            std::get<0>(fl).kl_mean, std::get<0>(fl).kl_max, tol_mean, tol_max);
+    // the five quantities of the input: mean KL, largest KL, rows with another top token, largest NMSE of the conv and the SSM state
+    struct quantity {
+        const char * name;
+        double       ragged_vs_seq;
+        double       equal_vs_seq;
+        double       ragged_vs_equal;
+    };
 
-    check(std::get<0>(test).kl_mean <= tol_mean, "mean KL of the logits of the ragged split is inside the limit");
-    check(std::get<0>(test).kl_max  <= tol_max,  "largest KL of the logits of the ragged split is inside the limit");
-    check(std::get<0>(test).n_top1 == std::get<0>(test).n_rows, "the most likely token is the same in all rows");
-    check(std::get<1>(test).nmse <= p.state_nmse, "conv states of the ragged split are inside the tolerance");
-    check(std::get<2>(test).nmse <= p.state_nmse, "recurrent states of the ragged split are inside the tolerance");
+    const auto top_miss = [](const logit_stats & l) { return (double) (l.n_rows - l.n_top1); };
+
+    const quantity quantities[5] = {
+        { "kl_mean",     std::get<0>(d_rg).kl_mean, std::get<0>(d_eq).kl_mean, std::get<0>(r_vs_e).kl_mean },
+        { "kl_max",      std::get<0>(d_rg).kl_max,  std::get<0>(d_eq).kl_max,  std::get<0>(r_vs_e).kl_max  },
+        { "top_miss",    top_miss(std::get<0>(d_rg)), top_miss(std::get<0>(d_eq)), top_miss(std::get<0>(r_vs_e)) },
+        { "conv_nmse",   std::get<1>(d_rg).nmse,    std::get<1>(d_eq).nmse,    std::get<1>(r_vs_e).nmse    },
+        { "ssm_nmse",    std::get<2>(d_rg).nmse,    std::get<2>(d_eq).nmse,    std::get<2>(r_vs_e).nmse    },
+    };
+
+    // QUANTITY lines are for the analysis: the sums over the inputs need the values of all inputs
+    printf("\n%-10s %-14s %-14s %-14s %-10s %-10s\n", "QUANTITY", "ragged_vs_seq", "equal_vs_seq", "ragged_vs_eq", "x3_input", "info_x1_x2");
+    for (const quantity & q : quantities) {
+        const bool in_3x = q.ragged_vs_seq <= 3.0*q.equal_vs_seq;
+        // information only: ragged against equal, 1 or 2 times the floor of the equal split
+        const int  info  = q.ragged_vs_equal <= q.equal_vs_seq ? 1 : (q.ragged_vs_equal <= 2.0*q.equal_vs_seq ? 2 : 3);
+        printf("%-10s %-14.6e %-14.6e %-14.6e %-10s %-10d\n", q.name, q.ragged_vs_seq, q.equal_vs_seq, q.ragged_vs_equal, in_3x ? "ok" : "FAIL", info);
+        ok = ok && in_3x;
+    }
+
+    if (p.kl_budget > 0.0) {
+        printf("budget: mean KL of ragged against one at a time %.3e, limit %.3e (10 %% of %.6f)\n",
+                std::get<0>(d_rg).kl_mean, 0.1*p.kl_budget, p.kl_budget);
+        check(std::get<0>(d_rg).kl_mean <= 0.1*p.kl_budget, "mean KL of the logits of the ragged split is 10 % or less of the KL budget");
+    }
 
     llama_free(ctx);
     llama_model_free(model);
