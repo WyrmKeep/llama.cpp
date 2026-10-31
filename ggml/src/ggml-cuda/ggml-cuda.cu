@@ -3971,6 +3971,90 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+// The conv input, the new conv state and the convolution of a Gated DeltaNet layer:
+//   concat -> cpy (the new conv state into the cache) -> ssm_conv -> silu
+// The model code puts the four nodes next to each other, with only views between them.
+// ggml_cuda_op_ssm_conv_concat runs them as one kernel that does not write the concat.
+struct ggml_cuda_ssm_conv_concat_match {
+    ggml_tensor * concat   = nullptr;
+    ggml_tensor * cpy      = nullptr;
+    ggml_tensor * conv     = nullptr;
+    ggml_tensor * silu     = nullptr;
+    int           cpy_idx  = 0;
+    int           silu_idx = 0;
+};
+
+// The match uses the shapes, the strides, the op and the use counts of the nodes. It does not use the data
+// pointers, because graph_optimize runs before the allocation. graph_optimize and the evaluation must find the same match.
+static bool ggml_cuda_match_ssm_conv_concat(
+        const ggml_cgraph * cgraph, int node_idx, ggml_cuda_ssm_conv_concat_match & match) {
+    ggml_tensor * concat = cgraph->nodes[node_idx];
+    if (concat->op != GGML_OP_CONCAT) {
+        return false;
+    }
+
+    // the next nodes that are not views are the cpy, the ssm_conv and the silu
+    static const ggml_op ops[3] = { GGML_OP_CPY, GGML_OP_SSM_CONV, GGML_OP_UNARY };
+    int idx[3];
+    int found = 0;
+    for (int j = node_idx + 1; j < cgraph->n_nodes && found < 3; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(n)) {
+            continue;
+        }
+        if (n->op != ops[found]) {
+            return false;
+        }
+        idx[found++] = j;
+    }
+    if (found < 3) {
+        return false;
+    }
+
+    ggml_tensor * cpy  = cgraph->nodes[idx[0]];
+    ggml_tensor * conv = cgraph->nodes[idx[1]];
+    ggml_tensor * silu = cgraph->nodes[idx[2]];
+
+    int view_idx = -1; // the view of the new conv state in the concat
+    int slot_idx = -1; // the view of the cache that the cpy writes
+    for (int j = node_idx + 1; j < idx[0]; ++j) {
+        if (cgraph->nodes[j] == cpy->src[0]) {
+            view_idx = j;
+        }
+        if (cgraph->nodes[j] == cpy->src[1]) {
+            slot_idx = j;
+        }
+    }
+    if (view_idx < 0 || slot_idx < 0) {
+        return false;
+    }
+
+    for (const ggml_tensor * n : { concat, cpy, conv, silu }) {
+        if ((n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            return false;
+        }
+    }
+
+    if (!ggml_cuda_ssm_conv_concat_supported(concat, cpy, conv, silu)) {
+        return false;
+    }
+
+    // Only the view of the new conv state and the ssm_conv read the concat. Only the cpy reads the view.
+    // Only the silu reads the ssm_conv. No other node and no output of the graph needs their data.
+    if (!ggml_node_has_n_uses(cgraph, node_idx, 2) || !ggml_node_has_n_uses(cgraph, idx[1], 1) ||
+        ggml_node_get_use_count(cgraph, view_idx) != 1 || (cgraph->nodes[view_idx]->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+
+    match.concat   = concat;
+    match.cpy      = cpy;
+    match.conv     = conv;
+    match.silu     = silu;
+    match.cpy_idx  = idx[0];
+    match.silu_idx = idx[2];
+    return true;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i, std::vector<bool> & nodes_fused) {
 
@@ -4055,6 +4139,22 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 ggml_cuda_op_moe_weighted_reduction(
                     *cuda_ctx, match.experts, match.expert_scale, match.weights, match.dst);
                 return match.node_count - 1;
+            }
+        }
+    }
+
+    // concat -> cpy -> ssm_conv -> silu: one kernel reads the conv state and the new input, writes the
+    // convolution and the new conv state, and does not write the concat. Skip it if an output overlaps an input.
+    if (node->op == GGML_OP_CONCAT && cuda_ctx->stream_context().concurrent_events.empty()) {
+        ggml_cuda_ssm_conv_concat_match match;
+        if (ggml_cuda_match_ssm_conv_concat(cgraph, i, match)) {
+            const int outputs[] = { match.silu_idx, match.cpy_idx };
+            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, match.silu_idx - i + 1, outputs, 2)) {
+#ifdef GGML_CUDA_DEBUG
+                GGML_LOG_INFO("%s: fused concat, cpy, ssm_conv and silu for %s\n", __func__, node->name);
+#endif
+                ggml_cuda_op_ssm_conv_concat(*cuda_ctx, match.concat, match.cpy, match.conv, match.silu);
+                return match.silu_idx - i;
             }
         }
     }
@@ -5214,6 +5314,15 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             }
         }
         for (int i = 0; i < cgraph->n_nodes; ++i) {
+            // Keep the inputs of the fused concat/cpy/ssm_conv/silu kernel alive until the silu so that they cannot alias its output.
+            ggml_cuda_ssm_conv_concat_match conv_concat;
+            if (cgraph->nodes[i]->op == GGML_OP_CONCAT && ggml_cuda_match_ssm_conv_concat(cgraph, i, conv_concat)) {
+                params->add_alloc_dep(params->user_data, conv_concat.concat->src[0], conv_concat.silu);
+                params->add_alloc_dep(params->user_data, conv_concat.concat->src[1], conv_concat.silu);
+                i = conv_concat.silu_idx;
+                continue;
+            }
+
             // Keep the inputs of the fused gate/up/GLU MMQ kernel alive until the GLU so that they cannot alias its output (under op offload the weights are buffer copies).
             if (i + 2 < cgraph->n_nodes && cgraph->nodes[i + 2]->op == GGML_OP_GLU) {
                 ggml_tensor * glu  = cgraph->nodes[i + 2];
