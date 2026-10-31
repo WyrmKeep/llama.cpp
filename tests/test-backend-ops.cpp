@@ -13433,6 +13433,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 512, 1));  // 4h PP-512
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
+    // 16 key heads and 32 value heads with S=128: the shape of the MMA path, for 1 to 3 sequences in a batch
+    for (int64_t n_seqs : { 1, 2, 3 }) {
+        for (int64_t n_tokens : { 65, 128, 256, 512, 1024, 1173, 2048 }) {
+            test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, n_tokens, n_seqs, 2));
+        }
+    }
 
     // lightning_indexer
     for (int kv : { 256, 4096, 65536 }) {
