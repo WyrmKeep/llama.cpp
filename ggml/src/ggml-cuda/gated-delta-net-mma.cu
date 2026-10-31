@@ -405,6 +405,13 @@ static gdn_path select_gdn_mma_path(int device, const ggml_cuda_gdn_mma_args & a
          info.cc != GGML_CUDA_CC_BLACKWELL && info.cc != GGML_CUDA_CC_DGX_SPARK)) {
         return gdn_path::ar;
     }
+    // Candidate for a GPU with 38 SMs: split the value columns so that the grid has more thread blocks than SMs.
+    if (info.nsm == 38) {
+        if (a.n_seqs == 1) {
+            return init<16, 64>(device) ? gdn_path::slice64 : gdn_path::ar;
+        }
+        return init<16, 32, 2>(device) ? gdn_path::slice32_two_blocks : gdn_path::ar;
+    }
     // Value splitting pays off when whole heads leave at least half the SMs idle.
     if (a.H * a.n_seqs * 2 <= info.nsm) {
         // A grid that already fits in one wave benefits from a larger register budget.
@@ -430,7 +437,9 @@ bool ggml_cuda_gdn_mma_launch(int device, const ggml_cuda_gdn_mma_args & a, cuda
 #ifdef GGML_USE_HIP
     gdn_single<16, 64><<<a.H * a.n_seqs * 2, dim3(32, 8), sizeof(shared<16, 64>), stream>>>(a);
 #else
-    if (path == gdn_path::slice32_two_blocks) {
+    if (path == gdn_path::slice64) {
+        gdn_single<16, 64><<<a.H * a.n_seqs * 2, dim3(32, 8), sizeof(shared<16, 64>), stream>>>(a);
+    } else if (path == gdn_path::slice32_two_blocks) {
         gdn_single<16, 32, 2><<<a.H * a.n_seqs * 4, dim3(32, 8), sizeof(shared<16, 32>), stream>>>(a);
     } else if (path == gdn_path::slice32_one_block) {
         gdn_single<16, 32, 1><<<a.H * a.n_seqs * 4, dim3(32, 8), sizeof(shared<16, 32>), stream>>>(a);
