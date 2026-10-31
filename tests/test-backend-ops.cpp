@@ -12151,9 +12151,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // the products of some rows of a matrix with a few columns, as the output head of a model does for a few tokens
     // the same row is in several columns of ids: the backend must accept this (see ggml_mul_mat_rows)
+    // a case has n_cols*n_ids values. The NMSE of only a few values is not stable: a value near 0 has a large relative error
+    // (tests/test-mul-mat-rows.cpp compares the values bit for bit, also for 1 and 2 ids)
     for (ggml_type type_a : {GGML_TYPE_Q4_0, GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0, GGML_TYPE_Q4_K, GGML_TYPE_Q6_K}) {
         for (int64_t n_cols : {1, 2, 3, 4}) {
-            for (int64_t n_ids : {1, 10, 33}) {
+            for (int64_t n_ids : {10, 33}) {
                 for (bool same_rows : {true, false}) {
                     test_cases.emplace_back(new test_mul_mat_rows(type_a, 4096, 2560, n_cols, n_ids, same_rows));
                 }
