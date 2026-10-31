@@ -7,7 +7,7 @@
 // of the same code make (the self-repeat floor), and one sequence at a time.
 //
 //   test-ragged-suffix -m model.gguf [-ngl N] [--prefix N] [--lens 43,47,73] [--text file] [--all-logits]
-//                      [--kl-budget X] [--state-nmse X]
+//                      [--kl-mean X] [--kl-max X] [--state-nmse X]
 
 #include "llama.h"
 #include "common.h"
@@ -44,7 +44,8 @@ struct test_params {
     int         ngl        = 999;
     int         n_prefix   = 600;
     bool        all_logits = false;
-    double      kl_budget  = 0.027830; // the budget of the quantised model, see docs/method.md
+    double      kl_mean    = 1e-5;     // the limit of the mean KL divergence, 10 times the floor when the floor is larger
+    double      kl_max     = 1e-3;     // the limit of the largest KL divergence, same rule
     double      state_nmse = 5e-4;     // the tolerance of the ops
     std::vector<int> lens  = { 43, 47, 73 };
 };
@@ -319,8 +320,10 @@ int main(int argc, char ** argv) {
             p.text = next();
         } else if (arg == "--all-logits") {
             p.all_logits = true;
-        } else if (arg == "--kl-budget") {
-            p.kl_budget = atof(next());
+        } else if (arg == "--kl-mean") {
+            p.kl_mean = atof(next());
+        } else if (arg == "--kl-max") {
+            p.kl_max = atof(next());
         } else if (arg == "--state-nmse") {
             p.state_nmse = atof(next());
         } else if (arg == "--lens") {
@@ -463,8 +466,16 @@ int main(int argc, char ** argv) {
 
     check(ragged.n_passes == 1, "the ragged split decodes all the suffixes in one pass");
     check(old_split.n_passes > 1, "the equal split needs more than one pass");
-    check(std::get<0>(test).kl_max <= p.kl_budget, "KL of the logits of the ragged split is inside the budget");
-    check(std::get<0>(test).n_top1 >= std::get<0>(fl).n_top1, "the most likely tokens agree as often as in the self-repeat");
+    // the limits apply when the floor (the same build against itself) is below them, else the limit is 10 times the floor
+    const double tol_mean = std::get<0>(fl).kl_mean < p.kl_mean ? p.kl_mean : 10.0*std::get<0>(fl).kl_mean;
+    const double tol_max  = std::get<0>(fl).kl_max  < p.kl_max  ? p.kl_max  : 10.0*std::get<0>(fl).kl_max;
+
+    printf("floor: kl_mean %.3e kl_max %.3e -> limits: kl_mean %.3e kl_max %.3e\n",
+            std::get<0>(fl).kl_mean, std::get<0>(fl).kl_max, tol_mean, tol_max);
+
+    check(std::get<0>(test).kl_mean <= tol_mean, "mean KL of the logits of the ragged split is inside the limit");
+    check(std::get<0>(test).kl_max  <= tol_max,  "largest KL of the logits of the ragged split is inside the limit");
+    check(std::get<0>(test).n_top1 == std::get<0>(test).n_rows, "the most likely token is the same in all rows");
     check(std::get<1>(test).nmse <= p.state_nmse, "conv states of the ragged split are inside the tolerance");
     check(std::get<2>(test).nmse <= p.state_nmse, "recurrent states of the ragged split are inside the tolerance");
 
