@@ -3646,20 +3646,27 @@ private:
 
             llama_set_embeddings(ctx_tgt, slot_batched->need_embd());
 
-            // the decisions of a batch read the logits of their labels only: the output head computes these tokens
-            // the context ignores the list when it outputs embeddings
+            // a batch that holds only decisions reads the logits of their labels: the output head computes these tokens
+            // any other processing slot (completion, chat) samples from the full logits, so the batch keeps the full head
+            // the context also ignores the list when it outputs embeddings
             std::vector<llama_token> logit_tokens;
-            if (slot_batched->task->type == SERVER_TASK_TYPE_DECISION) {
-                for (const auto & slot : slots) {
-                    if (!slot.is_processing() || slot.task->type != SERVER_TASK_TYPE_DECISION) {
-                        continue;
-                    }
-                    for (const llama_token label : slot.task->decision.labels) {
-                        if (std::find(logit_tokens.begin(), logit_tokens.end(), label) == logit_tokens.end()) {
-                            logit_tokens.push_back(label);
-                        }
+            bool all_decision = slot_batched->task->type == SERVER_TASK_TYPE_DECISION;
+            for (const auto & slot : slots) {
+                if (!slot.is_processing()) {
+                    continue;
+                }
+                if (slot.task->type != SERVER_TASK_TYPE_DECISION) {
+                    all_decision = false;
+                    break;
+                }
+                for (const llama_token label : slot.task->decision.labels) {
+                    if (std::find(logit_tokens.begin(), logit_tokens.end(), label) == logit_tokens.end()) {
+                        logit_tokens.push_back(label);
                     }
                 }
+            }
+            if (!all_decision) {
+                logit_tokens.clear();
             }
             llama_set_logit_tokens(ctx_tgt, logit_tokens.data(), logit_tokens.size());
         }
