@@ -5040,6 +5040,83 @@ struct test_ssm_conv_bias_silu : public test_case {
     }
 };
 
+// GGML_OP_CONCAT + GGML_OP_CPY (new conv state) + GGML_OP_SSM_CONV + GGML_OP_UNARY(SILU) (fused operation)
+// The conv input and the new conv state of a Gated DeltaNet layer, in the node order of the model graph.
+struct test_ssm_conv_concat_cpy : public test_case {
+    const int64_t d_conv;
+    const int64_t n_channels;
+    const int64_t n_seq_tokens;
+    const int64_t n_seqs;
+    // the new input is the transpose of [n_channels, n_seq_tokens, n_seqs], as in the model graph
+    const bool    transposed;
+    // the conv state and the new input are results of operations, so that the graph allocator can reuse their buffers
+    const bool    intermediate;
+
+    ggml_tensor * cpy_node = nullptr;
+    ggml_tensor * out_node = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "SSM_CONV_CONCAT_CPY";
+    }
+
+    bool run_whole_graph() override { return true; }
+    bool use_graph_allocator() override { return intermediate; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { cpy_node, out_node }; }
+
+    std::string vars() override {
+        return VARS_TO_STR6(d_conv, n_channels, n_seq_tokens, n_seqs, transposed, intermediate);
+    }
+
+    test_ssm_conv_concat_cpy(int64_t d_conv = 4, int64_t n_channels = 256, int64_t n_seq_tokens = 8,
+            int64_t n_seqs = 1, bool transposed = true, bool intermediate = false)
+        : d_conv(d_conv), n_channels(n_channels), n_seq_tokens(n_seq_tokens), n_seqs(n_seqs),
+          transposed(transposed), intermediate(intermediate) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_state = d_conv - 1;
+
+        ggml_tensor * state = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_state, n_channels, n_seqs);
+        ggml_set_name(state, "state");
+        ggml_tensor * qkv = transposed ?
+            ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_channels, n_seq_tokens, n_seqs) :
+            ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_seq_tokens, n_channels, n_seqs);
+        ggml_set_name(qkv, "qkv");
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, n_channels);
+        ggml_set_name(w, "w");
+
+        // the cache has a few more rows than the sequences, the new conv state goes to the rows after the first
+        ggml_tensor * cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_state * n_channels, n_seqs + 2);
+        ggml_set_name(cache, "cache");
+
+        if (intermediate) {
+            state = ggml_scale(ctx, state, 1.0f);
+            qkv   = ggml_scale(ctx, qkv, 1.0f);
+        }
+
+        ggml_tensor * xn = transposed ? ggml_transpose(ctx, qkv) : qkv;
+
+        ggml_tensor * conv_input = ggml_concat(ctx, state, xn, 0);
+        ggml_set_name(conv_input, "conv_input");
+
+        ggml_tensor * state_last = ggml_view_3d(ctx, conv_input, n_state, n_channels, n_seqs,
+                conv_input->nb[1], conv_input->nb[2], ggml_row_size(conv_input->type, n_seq_tokens));
+        ggml_tensor * state_slot = ggml_view_2d(ctx, cache, n_state * n_channels, n_seqs, cache->nb[1], cache->nb[1]);
+        cpy_node = ggml_cpy(ctx, state_last, state_slot);
+        ggml_set_name(cpy_node, "conv_state_cpy");
+
+        out_node = ggml_silu(ctx, ggml_ssm_conv(ctx, conv_input, w));
+        ggml_set_name(out_node, "out");
+
+        // the same order of the nodes as in the model graph: the copy, then the convolution
+        if (mode == MODE_TEST) {
+            ggml_build_forward_expand(gf, cpy_node);
+            ggml_build_forward_expand(gf, out_node);
+        }
+        return out_node;
+    }
+};
+
 // GGML_OP_SSM_SCAN
 struct test_ssm_scan : public test_case {
     const ggml_type type;
@@ -11495,6 +11572,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+
+    // fused concat + cpy (new conv state) + ssm_conv + silu of a Gated DeltaNet layer
+    for (int64_t d_conv : {3, 4, 5, 7, 9}) {
+        for (bool transposed : {true, false}) {
+            // the short kernel path (n_t <= 32), n_t < d_conv - 1, and n_t at the edge of the long path
+            for (int64_t n_tokens : {1, 2, 3, 7, 32, 33, 64, 100}) {
+                test_cases.emplace_back(new test_ssm_conv_concat_cpy(d_conv, 256, n_tokens, 1, transposed, false));
+            }
+            test_cases.emplace_back(new test_ssm_conv_concat_cpy(d_conv, 128, 1, 3, transposed, false));
+            test_cases.emplace_back(new test_ssm_conv_concat_cpy(d_conv, 128, 70, 3, transposed, false));
+            test_cases.emplace_back(new test_ssm_conv_concat_cpy(d_conv, 384, 515, 2, transposed, false));
+        }
+        // the graph allocator can give the output the buffer of an input, then the kernel must not run
+        // (n_t is a multiple of 32: the kernel ssm_conv_long_token_f32 reads past the end of its input for other long n_t)
+        test_cases.emplace_back(new test_ssm_conv_concat_cpy(d_conv, 256, 64, 2, true, true));
+        test_cases.emplace_back(new test_ssm_conv_concat_cpy(d_conv, 256, 5, 1, false, true));
+    }
+    test_cases.emplace_back(new test_ssm_conv_concat_cpy(4, 8192, 515, 1, true, false)); // prefill of the Qwen3.5 class
+    test_cases.emplace_back(new test_ssm_conv_concat_cpy(4, 8192, 1, 3, true, false));   // generate
 
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 16, 1, 1024, 1, 32, 4)); // Mamba-1
     test_cases.emplace_back(new test_ssm_scan(GGML_TYPE_F32, 96, 64, 128, 8, 1, 1)); // Nemotron-3-Puzzle decode (scan path, unused warp in last block)
